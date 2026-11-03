@@ -53,7 +53,7 @@ CLAIM_CANDIDATE_SQL = """
 SELECT id FROM jobs
 WHERE (status = 'pending'   AND run_at <= NOW(6))
    OR (status = 'in_flight' AND lease_expires_at <= NOW(6))  -- expired lease
-ORDER BY run_at, id
+ORDER BY priority DESC, run_at, id
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 """

@@ -1,5 +1,7 @@
 from .db import transaction
 
+# Note: indexes are NOT declared here. They are managed below so the same code
+# works for brand-new databases AND for databases created in earlier phases.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -15,14 +17,44 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_error       TEXT NULL,
     created_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-                     ON UPDATE CURRENT_TIMESTAMP(6),
-    KEY idx_fetch (status, run_at)
+                     ON UPDATE CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+# index name -> column list
+INDEXES = {
+    # claim order: pending jobs by priority (high first), then oldest run_at
+    "idx_claim": "(status, priority DESC, run_at)",
+    # find in_flight jobs whose lease has expired
+    "idx_lease": "(status, lease_expires_at)",
+}
+
+# indexes from earlier phases that are replaced
+OBSOLETE_INDEXES = ["idx_fetch"]
+
+
+def _index_exists(cur, name: str) -> bool:
+    cur.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 'jobs' AND index_name = %s
+        """,
+        (name,),
+    )
+    return cur.fetchone()["n"] > 0
+
 
 def init_db() -> None:
-    """Create tables if they don't exist yet. Safe to run many times."""
+    """Create the table and bring its indexes up to date. Safe to run many times."""
     with transaction() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
+
+            for name in OBSOLETE_INDEXES:
+                if _index_exists(cur, name):
+                    cur.execute(f"DROP INDEX {name} ON jobs")
+
+            for name, columns in INDEXES.items():
+                if not _index_exists(cur, name):
+                    cur.execute(f"CREATE INDEX {name} ON jobs {columns}")

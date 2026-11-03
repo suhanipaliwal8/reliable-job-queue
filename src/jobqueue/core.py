@@ -8,17 +8,35 @@ def _decode_payload(job: dict | None) -> dict | None:
         job["payload"] = json.loads(job["payload"])
     return job
 
-def enqueue(job_type: str, payload: dict | None = None, max_attempts: int = 5) -> int:
-    """Add a job to the queue. Returns the new job's id."""
+def enqueue(
+    job_type: str,
+    payload: dict | None = None,
+    max_attempts: int = 5,
+    priority: int = 0,
+    delay_seconds: float = 0,
+) -> int:
+    """Add a job to the queue. Returns the new job's id.
+
+    priority:      higher number = more urgent (default 0, negatives allowed).
+    delay_seconds: the job will not run before NOW + this many seconds
+                   (measured by the DATABASE clock).
+    """
     if not job_type:
         raise ValueError("job_type must not be empty")
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds must not be negative")
     payload = payload or {}
 
     with transaction() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO jobs (job_type, payload, max_attempts) VALUES (%s, %s, %s)",
-                (job_type, json.dumps(payload), max_attempts),
+                """
+                INSERT INTO jobs (job_type, payload, max_attempts, priority, run_at)
+                VALUES (%s, %s, %s, %s, NOW(6) + INTERVAL %s SECOND)
+                """,
+                (job_type, json.dumps(payload), max_attempts, priority, delay_seconds),
             )
             return cur.lastrowid
 
@@ -35,7 +53,7 @@ CLAIM_CANDIDATE_SQL = """
 SELECT id FROM jobs
 WHERE (status = 'pending'   AND run_at <= NOW(6))
    OR (status = 'in_flight' AND lease_expires_at <= NOW(6))  -- expired lease
-ORDER BY run_at, id
+ORDER BY priority DESC, run_at, id
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 """

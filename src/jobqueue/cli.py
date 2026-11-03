@@ -21,12 +21,16 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="jobqueue", description="Reliable job queue")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init-db", help="Create tables if they don't exist")
+    sub.add_parser("init-db", help="Create tables/indexes if they don't exist")
 
     p_enqueue = sub.add_parser("enqueue", help="Add a job to the queue")
     p_enqueue.add_argument("job_type")
     p_enqueue.add_argument("data", nargs="*", help="payload as key=value pairs")
     p_enqueue.add_argument("--max-attempts", type=int, default=5)
+    p_enqueue.add_argument("--priority", type=int, default=0,
+                           help="higher number runs first (default 0)")
+    p_enqueue.add_argument("--delay", type=float, default=0,
+                           help="seconds to wait before the job becomes runnable")
 
     p_show = sub.add_parser("show", help="Show one job")
     p_show.add_argument("job_id", type=int)
@@ -36,7 +40,7 @@ def main(argv=None) -> None:
     p_worker.add_argument("--lease-seconds", type=float, default=30)
     p_worker.add_argument("--poll-interval", type=float, default=1.0)
     p_worker.add_argument("--drain", action="store_true",
-                          help="exit when the queue is empty")
+                          help="exit when no job is currently due")
 
     args = parser.parse_args(argv)
 
@@ -44,7 +48,16 @@ def main(argv=None) -> None:
         init_db()
         print("Database initialised.")
     elif args.command == "enqueue":
-        job_id = enqueue(args.job_type, parse_key_values(args.data), args.max_attempts)
+        try:
+            job_id = enqueue(
+                args.job_type,
+                parse_key_values(args.data),
+                max_attempts=args.max_attempts,
+                priority=args.priority,
+                delay_seconds=args.delay,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Error: {exc}")
         print(f"Enqueued job {job_id}")
     elif args.command == "show":
         job = get_job(args.job_id)

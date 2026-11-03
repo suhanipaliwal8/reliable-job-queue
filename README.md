@@ -3,7 +3,7 @@
 A background-job engine built from scratch in Python + MySQL.
 No Celery, no Sidekiq: just SQL, transactions, and careful design.
 
-> Status: ✅ Phase 2 complete (workers + leases) → next: Phase 3 (priority + delayed jobs)
+> Status: ✅ Phase 3 complete (priority + delayed jobs) → next: Phase 4 (retries + backoff)
 
 ## Features (planned)
 - Durable queue: jobs survive crashes and restarts
@@ -39,6 +39,43 @@ python -m jobqueue worker --drain
 # 5. Run tests (stop workers first: tests truncate the jobs table)
 pytest -v
 ```
+
+## Usage
+
+```bash
+# normal job
+python -m jobqueue enqueue send_email to=a@b.com
+
+# urgent job (higher number = more urgent)
+python -m jobqueue enqueue send_email to=boss@b.com --priority 10
+
+# delayed job: not runnable for 10 minutes
+python -m jobqueue enqueue send_email to=a@b.com --delay 600
+
+# run a worker (--drain exits when nothing is due right now)
+python -m jobqueue worker
+```
+## Priority and scheduling
+
+- **Claim order:** `priority DESC, run_at ASC, id ASC`: the most urgent job goes first,
+  and equal-priority jobs are first-in-first-out.
+- **Delayed jobs** set `run_at = NOW() + delay` using the *database* clock. A job is
+  never claimed before its `run_at`. It runs at-or-after that time, depending on
+  worker polling and availability.
+- Priority is not preemptive: a running job is never interrupted.
+- **Known trade-off:** strict priority can starve low-priority jobs under constant
+  high-priority load. Priority aging is a possible future improvement.
+- Retry backoff (Phase 4) will reuse `run_at`: a failed job is simply rescheduled.
+
+## Indexes
+| Index | Columns | Purpose |
+|---|---|---|
+| `idx_claim` | `(status, priority DESC, run_at)` | fast "next pending job" lookup in claim order |
+| `idx_lease` | `(status, lease_expires_at)` | find in_flight jobs with expired leases |
+
+`init_db()` is an idempotent migration: it creates missing indexes and drops obsolete
+ones, so it can safely be re-run after pulling new code.
+
 
 ## How reliability works
 
@@ -103,7 +140,7 @@ def send_email(job):
 - [x] Phase 0: Project setup
 - [x] Phase 1: Durable queue core
 - [x] Phase 2: Worker + lease
-- [ ] Phase 3: Priority + delayed jobs
+- [x] Phase 3: Priority + delayed jobs
 - [ ] Phase 4: Retry + exponential backoff
 - [ ] Phase 5: Dead-letter queue + replay
 - [ ] Phase 6: Idempotency

@@ -3,7 +3,7 @@
 A background-job engine built from scratch in Python + MySQL.
 No Celery, no Sidekiq: just SQL, transactions, and careful design.
 
-> Status: ✅ Phase 1 complete (durable queue core) → next: Phase 2 (workers + leases)
+> Status: ✅ Phase 2 complete (workers + leases) → next: Phase 3 (priority + delayed jobs)
 
 ## Features (planned)
 - Durable queue: jobs survive crashes and restarts
@@ -27,14 +27,41 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 
-# 3. Create tables and add a job
+# 3. Create tables and add jobs
 python -m jobqueue init-db
 python -m jobqueue enqueue send_email to=a@b.com subject=Hello
-python -m jobqueue show 1
 
-# 4. Run tests
+# 4. Run a worker (Ctrl+C to stop). Run several in separate terminals!
+python -m jobqueue worker
+# or process everything and exit:
+python -m jobqueue worker --drain
+
+# 5. Run tests (stop workers first: tests truncate the jobs table)
 pytest -v
 ```
+
+## How reliability works
+
+### Claiming a job (no double-processing)
+A worker claims a job inside ONE transaction:
+```sql
+SELECT id FROM jobs WHERE <due> ORDER BY run_at, id LIMIT 1
+FOR UPDATE SKIP LOCKED;
+UPDATE jobs SET status='in_flight', locked_by=?, lease_expires_at=NOW()+lease ...
+```
+`FOR UPDATE` locks the row; `SKIP LOCKED` makes other workers pick a different one
+instead of waiting.
+
+### Leases (surviving dead workers)
+Every claim comes with a lease. If a worker crashes, its lease expires and another
+worker reclaims the job. Only the current lock owner can complete/fail a job
+(fencing), so a slow "zombie" worker can't overwrite the new owner's result.
+
+### Delivery guarantee
+**At-least-once.** A job is never lost, but may run more than once (e.g. a worker
+is slow and loses its lease). Handlers must therefore be idempotent (Phase 6).
+
+
 
 ## Configuration
 Environment variables (defaults work with the included docker-compose):
@@ -56,10 +83,26 @@ Failed jobs return to `pending` with a delay, or move to `dead` after max attemp
 - **Schema is designed up-front** (priority, run_at, lease columns) so later phases need no migrations.
 - **Config via environment variables** so the same code runs anywhere.
 
+### Other design notes
+- Time comes from the database clock (`NOW(6)`), never from worker machines.
+- `READ COMMITTED` isolation keeps row locking narrow and avoids needless blocking.
+- `attempts` is incremented at claim time, so jobs that crash workers still count.
+
+## Writing a handler
+```python
+from jobqueue.registry import handler
+
+@handler("send_email")
+def send_email(job):
+    payload = job["payload"]
+    ...
+```
+
+
 ## Roadmap
 - [x] Phase 0: Project setup
 - [x] Phase 1: Durable queue core
-- [ ] Phase 2: Worker + lease
+- [x] Phase 2: Worker + lease
 - [ ] Phase 3: Priority + delayed jobs
 - [ ] Phase 4: Retry + exponential backoff
 - [ ] Phase 5: Dead-letter queue + replay

@@ -193,3 +193,90 @@ def extend_lease(job_id: int, worker_id: str, lease_seconds: float = 30) -> bool
                 (lease_seconds, job_id, worker_id),
             )
             return cur.rowcount == 1
+
+# ---------------------------------------------------------------------------
+# Dead-letter queue: inspect, replay, purge
+# ---------------------------------------------------------------------------
+
+def list_dead_jobs(limit: int = 50, job_type: str | None = None) -> list[dict]:
+    """Dead jobs, most recently dead first. Optionally filter by job type."""
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+
+    sql = "SELECT * FROM jobs WHERE status = 'dead'"
+    params: list = []
+    if job_type:
+        sql += " AND job_type = %s"
+        params.append(job_type)
+    sql += " ORDER BY updated_at DESC, id DESC LIMIT %s"
+    params.append(limit)
+
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            jobs = cur.fetchall()
+    return [_decode_payload(job) for job in jobs]
+
+
+def replay_job(job_id: int) -> bool:
+    """Send ONE dead job back to the queue with a fresh set of attempts.
+
+    Returns False if the job doesn't exist or isn't dead. A single conditional
+    UPDATE makes this safe even if several people replay at the same moment:
+    only one of them will match `status = 'dead'`.
+    """
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'pending', attempts = 0, run_at = NOW(6),
+                    locked_by = NULL, lease_expires_at = NULL
+                WHERE id = %s AND status = 'dead'
+                """,
+                (job_id,),
+            )
+            return cur.rowcount == 1
+
+
+def replay_dead_jobs(job_type: str | None = None) -> int:
+    """Replay every dead job (optionally only one job type). Returns the count."""
+    sql = """
+        UPDATE jobs
+        SET status = 'pending', attempts = 0, run_at = NOW(6),
+            locked_by = NULL, lease_expires_at = NULL
+        WHERE status = 'dead'
+    """
+    params: list = []
+    if job_type:
+        sql += " AND job_type = %s"
+        params.append(job_type)
+
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.rowcount
+
+
+def purge_job(job_id: int) -> bool:
+    """Permanently delete ONE dead job. Never touches jobs in any other status."""
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM jobs WHERE id = %s AND status = 'dead'", (job_id,)
+            )
+            return cur.rowcount == 1
+
+
+def purge_dead_jobs(job_type: str | None = None) -> int:
+    """Permanently delete all dead jobs (optionally one job type). Returns the count."""
+    sql = "DELETE FROM jobs WHERE status = 'dead'"
+    params: list = []
+    if job_type:
+        sql += " AND job_type = %s"
+        params.append(job_type)
+
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.rowcount

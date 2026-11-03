@@ -3,7 +3,7 @@
 A background-job engine built from scratch in Python + MySQL.
 No Celery, no Sidekiq: just SQL, transactions, and careful design.
 
-> Status: ✅ Phase 4 complete (retries + backoff) → next: Phase 5 (dead-letter queue + replay)
+> Status: ✅ Phase 5 complete (dead-letter queue + replay) → next: Phase 6 (idempotency)
 
 ## Features (planned)
 - Durable queue: jobs survive crashes and restarts
@@ -139,6 +139,35 @@ uses up attempts. When such a job's lease expires and no attempts remain, it goe
 `pending → in_flight → done`  
 Failed jobs return to `pending` with a delay, or move to `dead` after max attempts.
 
+## Dead-letter queue (DLQ)
+
+A job that fails `max_attempts` times (or keeps crashing its worker) moves to
+`status = 'dead'`. Dead jobs are kept, not deleted, so a human can find out why they
+failed and decide what to do.
+
+```bash
+python -m jobqueue dead list                     # what died, and why
+python -m jobqueue dead list --job-type email    # filter by type
+
+python -m jobqueue dead replay 42                # send one job back to the queue
+python -m jobqueue dead replay --all --job-type email   # replay a whole type
+
+python -m jobqueue dead purge 42                 # delete one dead job
+python -m jobqueue dead purge --all --yes        # delete all dead jobs
+```
+
+### How replay works
+- Replay is ONE conditional `UPDATE ... WHERE id = ? AND status = 'dead'`, so two
+  people replaying the same job at once cannot both succeed.
+- It resets `attempts` to 0 and `run_at` to now. It keeps the payload, the priority,
+  and `last_error` (useful debugging context).
+- Only `dead` jobs can be replayed or purged. Live jobs are never touched.
+- **Fix the cause before replaying**, or the job will simply die again. Replaying a
+  huge number of jobs at once can overload the service that was failing, so prefer
+  `--job-type` and replay in batches.
+- A replayed job may have partly run before it died, so handlers must be idempotent
+  (Phase 6).
+
 ## Design notes
 - **MySQL/InnoDB** gives transactions and row-level locks, which are required for safe multi-worker locking.
 - **Schema is designed up-front** (priority, run_at, lease columns) so later phases need no migrations.
@@ -166,7 +195,7 @@ def send_email(job):
 - [x] Phase 2: Worker + lease
 - [x] Phase 3: Priority + delayed jobs
 - [x] Phase 4: Retry + exponential backoff
-- [ ] Phase 5: Dead-letter queue + replay
+- [x] Phase 5: Dead-letter queue + replay
 - [ ] Phase 6: Idempotency
 - [ ] Phase 7: Inspect CLI + API
 - [ ] Phase 8: Crash demo

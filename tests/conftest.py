@@ -37,3 +37,18 @@ def make_due():
                     (job_id,),
                 )
     return _make_due
+
+@pytest.fixture
+def make_dead_job():
+    """Return a function that creates a job and takes it all the way to 'dead'
+    through the real claim -> fail path (no SQL shortcuts)."""
+    from jobqueue.core import claim_job, enqueue, fail_job
+
+    def _make(job_type="t", payload=None, **kwargs):
+        job_id = enqueue(job_type, payload, max_attempts=1, **kwargs)
+        job = claim_job("fixture-worker")
+        assert job is not None and job["id"] == job_id
+        assert fail_job(job_id, "fixture-worker", "boom") == "dead"
+        return job_id
+
+    return _make

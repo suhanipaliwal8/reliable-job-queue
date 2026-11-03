@@ -73,3 +73,59 @@ def claim_job(worker_id: str, lease_seconds: float = 30) -> dict | None:
             cur.execute("SELECT * FROM jobs WHERE id = %s", (candidate["id"],))
             job = cur.fetchone()
     return _decode_payload(job)
+
+
+def complete_job(job_id: int, worker_id: str) -> bool:
+    """Mark a job done. Returns False if this worker no longer owns the job."""
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'done', locked_by = NULL, lease_expires_at = NULL
+                WHERE id = %s AND locked_by = %s AND status = 'in_flight'
+                """,
+                (job_id, worker_id),
+            )
+            return cur.rowcount == 1
+
+
+def fail_job(job_id: int, worker_id: str, error: str) -> str | None:
+    """Record a failure. Returns the new status ('pending' or 'dead'),
+    or None if this worker no longer owns the job.
+
+    NOTE: simple version for now. A failed job is retried immediately.
+    Phase 4 adds exponential backoff; Phase 5 adds inspect/replay for dead jobs.
+    """
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = IF(attempts >= max_attempts, 'dead', 'pending'),
+                    locked_by = NULL,
+                    lease_expires_at = NULL,
+                    last_error = %s
+                WHERE id = %s AND locked_by = %s AND status = 'in_flight'
+                """,
+                (error[:5000], job_id, worker_id),
+            )
+            if cur.rowcount != 1:
+                return None
+            cur.execute("SELECT status FROM jobs WHERE id = %s", (job_id,))
+            return cur.fetchone()["status"]
+
+
+def extend_lease(job_id: int, worker_id: str, lease_seconds: float = 30) -> bool:
+    """Heartbeat: push the lease further into the future for a long-running job."""
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET lease_expires_at = NOW(6) + INTERVAL %s SECOND
+                WHERE id = %s AND locked_by = %s AND status = 'in_flight'
+                """,
+                (lease_seconds, job_id, worker_id),
+            )
+            return cur.rowcount == 1

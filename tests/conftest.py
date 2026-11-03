@@ -52,3 +52,13 @@ def make_dead_job():
         return job_id
 
     return _make
+
+@pytest.fixture(autouse=True)
+def clean_tables():
+    """Before every test: make sure the tables exist and are empty."""
+    init_db()
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            for table in ("jobs", "side_effects", "charges", "receipts"):
+                cur.execute(f"TRUNCATE TABLE {table}")
+    yield

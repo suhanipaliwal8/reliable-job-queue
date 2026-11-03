@@ -3,7 +3,7 @@
 A background-job engine built from scratch in Python + MySQL.
 No Celery, no Sidekiq: just SQL, transactions, and careful design.
 
-> Status: ✅ Phase 5 complete (dead-letter queue + replay) → next: Phase 6 (idempotency)
+> Status: ✅ Phase 6 complete (idempotency) → next: Phase 7 (inspect CLI + API)
 
 ## Features (planned)
 - Durable queue: jobs survive crashes and restarts
@@ -67,6 +67,17 @@ python -m jobqueue worker
   high-priority load. Priority aging is a possible future improvement.
 - Retry backoff (Phase 4) will reuse `run_at`: a failed job is simply rescheduled.
 
+
+## Writing a handler
+```python
+from jobqueue.registry import handler
+
+@handler("send_email")
+def send_email(job):
+    payload = job["payload"]
+    ...
+```
+
 ## Indexes
 | Index | Columns | Purpose |
 |---|---|---|
@@ -95,7 +106,7 @@ worker reclaims the job. Only the current lock owner can complete/fail a job
 (fencing), so a slow "zombie" worker can't overwrite the new owner's result.
 
 ### Delivery guarantee
-**At-least-once.** A job is never lost, but may run more than once (e.g. a worker
+**At-least-once delivery plus idempotent handlers (run_once) gives exactly-once effects.** A job is never lost, but may run more than once (e.g. a worker
 is slow and loses its lease). Handlers must therefore be idempotent (Phase 6).
 
 ## Configuration
@@ -168,6 +179,53 @@ python -m jobqueue dead purge --all --yes        # delete all dead jobs
 - A replayed job may have partly run before it died, so handlers must be idempotent
   (Phase 6).
 
+## Idempotency (safe re-runs)
+
+Delivery is **at-least-once**, so a job can run more than once: a slow worker loses
+its lease, a worker crashes mid-job, or a dead job is replayed. Handlers must
+therefore make their side effects **idempotent**.
+
+`run_once(key, action)` guarantees `action` happens at most once per key:
+
+```python
+from jobqueue.effects import run_once
+
+@handler("charge_and_receipt")
+def charge_and_receipt(job):
+    p = job["payload"]
+    run_once(f"charge:{p['order_id']}",  lambda cur: insert_charge(cur, p),  job["id"])
+    run_once(f"receipt:{p['order_id']}", lambda cur: insert_receipt(cur, p), job["id"])
+```
+
+How it works:
+- The key is inserted into `side_effects` (PRIMARY KEY) **in the same transaction** as
+  the effect, so they commit or roll back together.
+- Duplicate key means the effect already happened, so the action is skipped.
+- If the action fails or the process dies, the transaction rolls back and the key is
+  not consumed, so the retry can try again.
+- Two concurrent callers are serialized by the PRIMARY KEY: exactly one wins.
+
+Key design rules:
+- Derive keys from **business identity** (`charge:order-123`), not job ids: two jobs
+  for the same order must not both charge.
+- Use **one key per step**, so a retry resumes after the last finished step.
+
+### Demo: a crash between two steps
+```bash
+# BROKEN on purpose: double-charges after the simulated crash
+python -m jobqueue enqueue naive_charge_and_receipt order_id=A1 customer=asha amount_cents=49900 fail_after_charge=1
+# SAFE: charges once, retry only sends the receipt
+python -m jobqueue enqueue charge_and_receipt order_id=B2 customer=asha amount_cents=49900 fail_after_charge=1
+python -m jobqueue worker --backoff-base 1
+```
+`pause_after_charge=30` lets you press Ctrl+C for a real crash instead.
+
+### Limits
+- Here the "payment provider" is a table in the same database, so the effect and the key
+  share one transaction. A real external API cannot join that transaction: pass the key
+  to the provider too (e.g. Stripe's `Idempotency-Key` header).
+- `side_effects` grows forever; a production system would expire old keys.
+
 ## Design notes
 - **MySQL/InnoDB** gives transactions and row-level locks, which are required for safe multi-worker locking.
 - **Schema is designed up-front** (priority, run_at, lease columns) so later phases need no migrations.
@@ -178,15 +236,6 @@ python -m jobqueue dead purge --all --yes        # delete all dead jobs
 - `READ COMMITTED` isolation keeps row locking narrow and avoids needless blocking.
 - `attempts` is incremented at claim time, so jobs that crash workers still count.
 
-## Writing a handler
-```python
-from jobqueue.registry import handler
-
-@handler("send_email")
-def send_email(job):
-    payload = job["payload"]
-    ...
-```
 
 
 ## Roadmap
@@ -196,6 +245,6 @@ def send_email(job):
 - [x] Phase 3: Priority + delayed jobs
 - [x] Phase 4: Retry + exponential backoff
 - [x] Phase 5: Dead-letter queue + replay
-- [ ] Phase 6: Idempotency
+- [x] Phase 6: Idempotency
 - [ ] Phase 7: Inspect CLI + API
 - [ ] Phase 8: Crash demo

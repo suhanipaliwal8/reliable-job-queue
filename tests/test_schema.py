@@ -20,3 +20,10 @@ def test_init_db_can_run_repeatedly():
     init_db()
     init_db()
     assert "idx_claim" in _index_names()
+
+def test_init_db_creates_idempotency_and_demo_tables():
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SHOW TABLES")
+            names = {list(row.values())[0] for row in cur.fetchall()}
+    assert {"jobs", "side_effects", "charges", "receipts"} <= names

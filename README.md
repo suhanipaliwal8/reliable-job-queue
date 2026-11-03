@@ -2,7 +2,24 @@
 
 A background-job engine built from scratch in Python + SQLite.
 
-> Status: 🚧 Under construction (Phase 0: project setup)
+> Status: ✅ Phase 0 complete (setup) → next: Phase 1 (durable queue core)
+
+## Setup
+    python -m venv .venv
+    source .venv/bin/activate      # Windows: .venv\Scripts\activate
+    pip install -e ".[dev]"
+    pytest
+
+## Roadmap
+- [x] Phase 0: Project setup
+- [ ] Phase 1: Durable queue core
+- [ ] Phase 2: Worker + lease
+- [ ] Phase 3: Priority + delayed jobs
+- [ ] Phase 4: Retry + exponential backoff
+- [ ] Phase 5: Dead-letter queue + replay
+- [ ] Phase 6: Idempotency
+- [ ] Phase 7: Inspect CLI + API
+- [ ] Phase 8: Crash demo
 
 ## Goals
 - Durable queue: jobs survive crashes

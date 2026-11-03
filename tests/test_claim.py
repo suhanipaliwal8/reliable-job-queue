@@ -57,16 +57,17 @@ def test_stale_worker_cannot_complete_after_losing_lease(expire_lease):
     assert job["locked_by"] is None
 
 
-def test_fail_job_requeues_until_max_attempts_then_dead():
+def test_fail_job_requeues_until_max_attempts_then_dead(make_due):
     job_id = enqueue("t", max_attempts=2)
 
     claim_job("w1")
     assert fail_job(job_id, "w1", "boom") == "pending"
+    make_due(job_id)                      # skip the backoff wait
 
     claim_job("w1")
     assert fail_job(job_id, "w1", "boom") == "dead"
     assert get_job(job_id)["last_error"] == "boom"
-
+    
 
 def test_extend_lease_only_works_for_the_owner():
     job_id = enqueue("t")

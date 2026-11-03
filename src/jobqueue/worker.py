@@ -17,10 +17,13 @@ def make_worker_id() -> str:
 
 
 class Worker:
-    def __init__(self, worker_id=None, lease_seconds=30, poll_interval=1.0):
+    def __init__(self, worker_id=None, lease_seconds=30, poll_interval=1.0,
+                 backoff_base=2.0, backoff_cap=300.0):
         self.worker_id = worker_id or make_worker_id()
         self.lease_seconds = lease_seconds
         self.poll_interval = poll_interval
+        self.backoff_base = backoff_base
+        self.backoff_cap = backoff_cap
         self._stop = False
 
     def stop(self):
@@ -42,7 +45,10 @@ class Worker:
                 raise LookupError(f"No handler registered for job type '{job['job_type']}'")
             func(job)
         except Exception as exc:
-            status = fail_job(job["id"], self.worker_id, f"{type(exc).__name__}: {exc}")
+            status = fail_job(
+                job["id"], self.worker_id, f"{type(exc).__name__}: {exc}",
+                backoff_base=self.backoff_base, backoff_cap=self.backoff_cap,
+            )
             log.warning("[%s] job %s failed (%s) -> %s",
                         self.worker_id, job["id"], exc, status or "lease lost")
         else:

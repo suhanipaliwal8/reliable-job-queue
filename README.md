@@ -3,7 +3,7 @@
 A background-job engine built from scratch in Python + MySQL.
 No Celery, no Sidekiq: just SQL, transactions, and careful design.
 
-> Status: ✅ Phase 3 complete (priority + delayed jobs) → next: Phase 4 (retries + backoff)
+> Status: ✅ Phase 4 complete (retries + backoff) → next: Phase 5 (dead-letter queue + replay)
 
 ## Features (planned)
 - Durable queue: jobs survive crashes and restarts
@@ -98,8 +98,6 @@ worker reclaims the job. Only the current lock owner can complete/fail a job
 **At-least-once.** A job is never lost, but may run more than once (e.g. a worker
 is slow and loses its lease). Handlers must therefore be idempotent (Phase 6).
 
-
-
 ## Configuration
 Environment variables (defaults work with the included docker-compose):
 
@@ -110,6 +108,32 @@ Environment variables (defaults work with the included docker-compose):
 | JQ_DB_USER | jobqueue |
 | JQ_DB_PASSWORD | jobqueue_pw |
 | JQ_DB_NAME | jobqueue |
+
+## Retries and backoff
+
+When a handler raises an exception, the job is retried with **exponential backoff
+and jitter**:
+
+`delay = min(cap, base × 2^(attempt−1))`, then randomised to 50–100% of that value.
+
+| Attempt that failed | Delay (base=2s, no jitter) | With jitter |
+|---|---|---|
+| 1 | 2s | 1–2s |
+| 2 | 4s | 2–4s |
+| 3 | 8s | 4–8s |
+| 4 | 16s | 8–16s |
+| … | capped at 300s | |
+
+- **Why backoff?** Instant retries cause *retry storms* against a struggling service.
+- **Why jitter?** Without it, jobs that failed together retry together (thundering herd).
+- Retries reuse `run_at`: a failed job is simply invisible to workers until it is due.
+- After `max_attempts` failures the job moves to `dead` (see Phase 5).
+- Tune with `python -m jobqueue worker --backoff-base 2 --backoff-cap 300`.
+
+### Crash loops ("poison jobs")
+`attempts` is counted when a job is *claimed*, so a job that crashes its worker still
+uses up attempts. When such a job's lease expires and no attempts remain, it goes to
+`dead` instead of being claimed again forever.
 
 ## Job lifecycle
 `pending → in_flight → done`  
@@ -141,7 +165,7 @@ def send_email(job):
 - [x] Phase 1: Durable queue core
 - [x] Phase 2: Worker + lease
 - [x] Phase 3: Priority + delayed jobs
-- [ ] Phase 4: Retry + exponential backoff
+- [x] Phase 4: Retry + exponential backoff
 - [ ] Phase 5: Dead-letter queue + replay
 - [ ] Phase 6: Idempotency
 - [ ] Phase 7: Inspect CLI + API

@@ -41,6 +41,10 @@ def main(argv=None) -> None:
     p_worker.add_argument("--poll-interval", type=float, default=1.0)
     p_worker.add_argument("--drain", action="store_true",
                           help="exit when no job is currently due")
+    p_worker.add_argument("--backoff-base", type=float, default=2.0,
+                          help="first retry delay in seconds (doubles each attempt)")
+    p_worker.add_argument("--backoff-cap", type=float, default=300.0,
+                          help="maximum retry delay in seconds")
 
     args = parser.parse_args(argv)
 
@@ -65,7 +69,8 @@ def main(argv=None) -> None:
     elif args.command == "worker":
         logging.basicConfig(level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s")
-        worker = Worker(args.worker_id, args.lease_seconds, args.poll_interval)
+        worker = Worker(args.worker_id, args.lease_seconds, args.poll_interval,
+                        args.backoff_base, args.backoff_cap)
         try:
             worker.run_forever(drain=args.drain)
         except KeyboardInterrupt:

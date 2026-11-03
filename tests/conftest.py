@@ -25,3 +25,15 @@ def expire_lease():
                     (job_id,),
                 )
     return _expire
+
+@pytest.fixture
+def make_due():
+    """Return a function that makes a delayed job runnable NOW (instead of sleeping)."""
+    def _make_due(job_id):
+        with transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE jobs SET run_at = NOW(6) - INTERVAL 1 SECOND WHERE id = %s",
+                    (job_id,),
+                )
+    return _make_due

@@ -51,13 +51,15 @@ def get_job(job_id: int) -> dict | None:
     return _decode_payload(job)
 
 CLAIM_CANDIDATE_SQL = """
-SELECT id FROM jobs
+SELECT id, status, attempts, max_attempts FROM jobs
 WHERE (status = 'pending'   AND run_at <= NOW(6))
    OR (status = 'in_flight' AND lease_expires_at <= NOW(6))  -- expired lease
 ORDER BY priority DESC, run_at, id
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 """
+
+LEASE_EXPIRED_ERROR = "Lease expired on the final attempt (worker likely crashed)"
 
 
 def claim_job(worker_id: str, lease_seconds: float = 30) -> dict | None:
@@ -66,33 +68,49 @@ def claim_job(worker_id: str, lease_seconds: float = 30) -> dict | None:
     The job is either:
       - pending and due (run_at has passed), or
       - in_flight but its lease expired (the previous worker is presumed dead).
+
+    An expired-lease job that has used all its attempts is moved to 'dead'
+    instead of being run again (it probably keeps crashing workers).
     """
     with transaction() as conn:
         with conn.cursor() as cur:
-            # 1. Find a candidate and lock its row (skipping rows others locked).
-            cur.execute(CLAIM_CANDIDATE_SQL)
-            candidate = cur.fetchone()
-            if candidate is None:
-                return None
+            while True:
+                cur.execute(CLAIM_CANDIDATE_SQL)
+                candidate = cur.fetchone()
+                if candidate is None:
+                    return None
 
-            # 2. Mark it ours, in the SAME transaction, so no one can sneak in.
-            cur.execute(
-                """
-                UPDATE jobs
-                SET status = 'in_flight',
-                    locked_by = %s,
-                    lease_expires_at = NOW(6) + INTERVAL %s SECOND,
-                    attempts = attempts + 1
-                WHERE id = %s
-                """,
-                (worker_id, lease_seconds, candidate["id"]),
-            )
+                exhausted = (
+                    candidate["status"] == "in_flight"
+                    and candidate["attempts"] >= candidate["max_attempts"]
+                )
+                if exhausted:
+                    cur.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'dead', locked_by = NULL,
+                            lease_expires_at = NULL, last_error = %s
+                        WHERE id = %s
+                        """,
+                        (LEASE_EXPIRED_ERROR, candidate["id"]),
+                    )
+                    continue  # look for the next candidate
 
-            # 3. Read the updated row back to return it.
-            cur.execute("SELECT * FROM jobs WHERE id = %s", (candidate["id"],))
-            job = cur.fetchone()
-    return _decode_payload(job)
-
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'in_flight',
+                        locked_by = %s,
+                        lease_expires_at = NOW(6) + INTERVAL %s SECOND,
+                        attempts = attempts + 1
+                    WHERE id = %s
+                    """,
+                    (worker_id, lease_seconds, candidate["id"]),
+                )
+                cur.execute("SELECT * FROM jobs WHERE id = %s", (candidate["id"],))
+                job = cur.fetchone()
+                return _decode_payload(job)
+            
 
 def complete_job(job_id: int, worker_id: str) -> bool:
     """Mark a job done. Returns False if this worker no longer owns the job."""

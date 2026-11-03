@@ -1,6 +1,7 @@
 import json
 
 from .db import transaction
+from .backoff import compute_backoff
 
 def _decode_payload(job: dict | None) -> dict | None:
     """MySQL returns JSON columns as text; turn the payload back into a dict."""
@@ -108,31 +109,58 @@ def complete_job(job_id: int, worker_id: str) -> bool:
             return cur.rowcount == 1
 
 
-def fail_job(job_id: int, worker_id: str, error: str) -> str | None:
+def fail_job(
+    job_id: int,
+    worker_id: str,
+    error: str,
+    backoff_base: float = 2.0,
+    backoff_cap: float = 300.0,
+) -> str | None:
     """Record a failure. Returns the new status ('pending' or 'dead'),
     or None if this worker no longer owns the job.
 
-    NOTE: simple version for now. A failed job is retried immediately.
-    Phase 4 adds exponential backoff; Phase 5 adds inspect/replay for dead jobs.
+    If attempts remain, the job is rescheduled with exponential backoff
+    (run_at = now + delay). Otherwise it moves to 'dead'.
     """
     with transaction() as conn:
         with conn.cursor() as cur:
+            # Lock the row first: we READ attempts and then WRITE based on it.
+            cur.execute(
+                """
+                SELECT attempts, max_attempts FROM jobs
+                WHERE id = %s AND locked_by = %s AND status = 'in_flight'
+                FOR UPDATE
+                """,
+                (job_id, worker_id),
+            )
+            job = cur.fetchone()
+            if job is None:
+                return None  # we lost the lease; someone else owns this job now
+
+            if job["attempts"] >= job["max_attempts"]:
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'dead', locked_by = NULL, lease_expires_at = NULL,
+                        last_error = %s
+                    WHERE id = %s
+                    """,
+                    (error[:5000], job_id),
+                )
+                return "dead"
+
+            delay = round(compute_backoff(job["attempts"], backoff_base, backoff_cap), 3)
             cur.execute(
                 """
                 UPDATE jobs
-                SET status = IF(attempts >= max_attempts, 'dead', 'pending'),
-                    locked_by = NULL,
-                    lease_expires_at = NULL,
-                    last_error = %s
-                WHERE id = %s AND locked_by = %s AND status = 'in_flight'
+                SET status = 'pending', locked_by = NULL, lease_expires_at = NULL,
+                    last_error = %s,
+                    run_at = NOW(6) + INTERVAL %s SECOND
+                WHERE id = %s
                 """,
-                (error[:5000], job_id, worker_id),
+                (error[:5000], delay, job_id),
             )
-            if cur.rowcount != 1:
-                return None
-            cur.execute("SELECT status FROM jobs WHERE id = %s", (job_id,))
-            return cur.fetchone()["status"]
-
+            return "pending"
 
 def extend_lease(job_id: int, worker_id: str, lease_seconds: float = 30) -> bool:
     """Heartbeat: push the lease further into the future for a long-running job."""

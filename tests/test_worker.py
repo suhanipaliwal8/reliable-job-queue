@@ -37,14 +37,15 @@ def test_failing_handler_requeues_job_and_stores_error():
     assert "boom" in job["last_error"]
 
 
-def test_failing_job_becomes_dead_after_max_attempts():
+def test_failing_job_becomes_dead_after_max_attempts(make_due):
     job_id = enqueue("test_boom", max_attempts=2)
     worker = Worker("w1")
     worker.run_once()
+    make_due(job_id)                      # skip the backoff wait
     worker.run_once()
 
     assert get_job(job_id)["status"] == "dead"
-    assert worker.run_once() is False   # dead jobs are never picked up again
+    assert worker.run_once() is False     # dead jobs are never picked up again
 
 
 def test_unknown_job_type_fails_cleanly():

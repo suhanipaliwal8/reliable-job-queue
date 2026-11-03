@@ -32,8 +32,9 @@ class Worker:
         if job is None:
             return False
 
-        log.info("[%s] claimed job %s (%s), attempt %s",
-                 self.worker_id, job["id"], job["job_type"], job["attempts"])
+        log.info("[%s] claimed job %s (%s, priority %s), attempt %s",
+                 self.worker_id, job["id"], job["job_type"],
+                 job["priority"], job["attempts"])
 
         try:
             func = get_handler(job["job_type"])

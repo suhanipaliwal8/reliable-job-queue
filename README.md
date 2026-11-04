@@ -3,7 +3,7 @@
 A background-job engine built from scratch in Python + MySQL.
 No Celery, no Sidekiq: just SQL, transactions, and careful design.
 
-> Status: ✅ Phase 7 complete (inspect CLI + API) → next: Phase 8 (crash demo)
+> Status: ✅ Phase 8 complete (crash demo) → next: Phase 9 (stretch goals)
 
 ## Features (planned)
 - Durable queue: jobs survive crashes and restarts
@@ -262,6 +262,54 @@ python -m jobqueue serve        # http://127.0.0.1:8000  (interactive docs at /d
 | `GET /jobs/dead?limit=&job_type=` | dead-letter contents with `last_error` |
 | `GET /jobs/{id}` | one job (`404` if missing) |
 
+## Chaos test: proving reliability
+
+Simulated failures aren't convincing, so the project can hard-kill its own workers:
+
+```bash
+python -m jobqueue chaos                      # idempotent handler: should PASS
+python -m jobqueue chaos --naive --seed 7     # broken handler: should FAIL (on purpose)
+python -m jobqueue chaos --jobs 300 --workers 6 --kills 15
+```
+
+What it does:
+1. Enqueues N two-step jobs ("charge, pause, send receipt, pause").
+2. Starts real `worker` **processes** and, at random moments, **hard-kills** them
+   (`SIGKILL` on Linux/macOS, `TerminateProcess` on Windows): no `finally` blocks, no
+   `fail_job`, nothing rolled back by Python. Each killed worker is replaced.
+3. Waits until every job has finished, then checks three **invariants**:
+   - every job completed (none lost, stuck or dead)
+   - exactly one charge per order
+   - exactly one receipt per order
+
+Sample report:
+```
+CHAOS TEST  (mode: idempotent, run a1b2c3d4)
+  hard kills                     6  (5 hit a worker that was holding a job)
+  jobs that needed a retry       9  (most attempts on one job: 3)
+  jobs done / dead / unfinished  100 / 0 / 0  (of 100)
+  charges                        100  (expected 100)
+  [PASS] exactly one charge per order
+RESULT: PASS. Jobs survived every crash and no effect was applied twice.
+```
+
+Why it works:
+- **Leases** (Phase 2): a killed worker's job becomes claimable once its lease expires.
+- **Idempotency keys** (Phase 6): the retry skips steps that already happened,
+  including the case where *every* effect was done but the worker died before
+  reporting success.
+- `--naive` swaps in a handler without keys, to prove the test can actually fail.
+
+Notes:
+- The runner refuses to start unless the queue is idle, and it only counts its own
+  rows (order ids are prefixed with a random run id). `--cleanup` deletes them.
+- `max_attempts` defaults to 50 here: a crash uses up an attempt, and with the normal
+  default of 5, unlucky random kills could trip the crash-loop protection (Phase 4).
+- It exits with a non-zero code on failure, so it can run in CI.
+- `--seed` repeats the kill schedule, not the exact outcome (timing is up to the OS).
+- It kills workers only, not MySQL or the network.
+
+
 
 ## Design notes
 - **MySQL/InnoDB** gives transactions and row-level locks, which are required for safe multi-worker locking.
@@ -291,4 +339,6 @@ python -m jobqueue serve        # http://127.0.0.1:8000  (interactive docs at /d
 - [x] Phase 5: Dead-letter queue + replay
 - [x] Phase 6: Idempotency
 - [x] Phase 7: Inspect CLI + API
-- [ ] Phase 8: Crash demo
+- [x] Phase 8: Crash demo
+- [ ] Phase 9: Stretch (job dependencies, dashboard)
+- [ ] Phase 10: Polish

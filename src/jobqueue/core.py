@@ -280,3 +280,33 @@ def purge_dead_jobs(job_type: str | None = None) -> int:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.rowcount
+
+def list_in_flight_jobs(limit: int = 50) -> list[dict]:
+    """Jobs currently held by workers, soonest-expiring lease first.
+
+    Each job gets `lease_remaining_seconds` (computed with the DB clock);
+    it is NEGATIVE when the lease has already expired.
+    """
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *, TIMESTAMPDIFF(MICROSECOND, NOW(6), lease_expires_at) AS lease_micros
+                FROM jobs
+                WHERE status = 'in_flight'
+                ORDER BY lease_expires_at, id
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            jobs = cur.fetchall()
+
+    result = []
+    for job in jobs:
+        micros = job.pop("lease_micros")
+        job["lease_remaining_seconds"] = None if micros is None else round(micros / 1_000_000, 3)
+        result.append(_decode_payload(job))
+    return result

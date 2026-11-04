@@ -365,6 +365,25 @@ python -m jobqueue chaos --jobs 300 --step-delay 0.3 --kills 10
 Health rules: **red** = dead jobs or jobs blocked by a dead dependency; **amber** =
 expired leases or a ready job waiting more than 30 s; **green** otherwise.
 
+## Testing
+
+```bash
+docker compose up -d
+pip install -e ".[dev,api]"
+pytest -v
+```
+
+Tests run against a separate **`jobqueue_test`** database (they truncate tables), so your
+development data is never touched, and you can run them while workers or the API are
+running. The suite refuses to start if the database name doesn't end in `_test`.
+
+First time on an existing MySQL volume? Create the test database once:
+```bash
+docker exec -it jobqueue-mysql mysql -uroot -prootpw -e "CREATE DATABASE IF NOT EXISTS jobqueue_test; GRANT ALL PRIVILEGES ON jobqueue_test.* TO 'jobqueue'@'%';"
+```
+
+GitHub Actions runs the suite on Python 3.10 and 3.12 against a real MySQL 8 service for
+every push and pull request.
 
 ## Design notes
 - **MySQL/InnoDB** gives transactions and row-level locks, which are required for safe multi-worker locking.

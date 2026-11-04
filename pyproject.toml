@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "jobqueue"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["PyMySQL>=1.1"]
+dependencies = ["PyMySQL[rsa]>=1.1"]
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx2"]

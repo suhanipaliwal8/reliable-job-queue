@@ -4,16 +4,19 @@ import logging
 
 from .core import (
     cancel_job,
+    count_prunable_done_jobs,
     enqueue,
     get_job,
     list_dead_jobs,
     list_dependencies,
     list_in_flight_jobs,
+    prune_done_jobs,
     purge_dead_jobs,
     purge_job,
     replay_dead_jobs,
     replay_job,
 )
+from .demo import DemoError, run_demo
 from .chaos import ChaosError, render_report, run_chaos
 from .schema import init_db
 from .stats import get_stats, get_stats_by_type
@@ -216,6 +219,19 @@ def run_chaos_command(args) -> None:
     if not report["ok"]:
         raise SystemExit(1)     # a non-zero exit code lets scripts and CI detect failure
 
+def run_prune_command(args) -> None:
+    try:
+        seconds = args.days * 86400
+        if args.dry_run:
+            count = count_prunable_done_jobs(seconds)
+            print(f"Dry run: would delete {count} finished job(s) "
+                  f"older than {args.days:g} day(s).")
+        else:
+            count = prune_done_jobs(seconds, batch_size=args.batch_size)
+            print(f"Deleted {count} finished job(s) older than {args.days:g} day(s).")
+    except ValueError as exc:
+        raise SystemExit(f"Error: {exc}")
+
 # ---------------------------------------------------------------------------
 # argument parsing
 # ---------------------------------------------------------------------------
@@ -306,6 +322,16 @@ def main(argv=None) -> None:
     p_dpurge.add_argument("--yes", action="store_true",
                           help="required confirmation for --all")
 
+    # ---- maintenance and demo ----
+    p_prune = sub.add_parser("prune", help="Delete old finished (done) jobs")
+    p_prune.add_argument("--days", type=float, default=7,
+                         help="delete done jobs older than this many days (default 7)")
+    p_prune.add_argument("--batch-size", type=int, default=1000)
+    p_prune.add_argument("--dry-run", action="store_true",
+                         help="only show how many jobs would be deleted")
+
+    sub.add_parser("demo", help="Run a guided demo of every feature, then clean up")
+
     args = parser.parse_args(argv)
 
     if args.command == "init-db":
@@ -355,3 +381,10 @@ def main(argv=None) -> None:
             raise SystemExit(
                 f"Job {args.job_id} not found, not waiting, or other jobs depend on it."
             )
+    elif args.command == "prune":
+        run_prune_command(args)
+    elif args.command == "demo":
+        try:
+            run_demo(render_stats)
+        except DemoError as exc:
+            raise SystemExit(f"Error: {exc}")

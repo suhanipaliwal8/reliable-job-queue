@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     job_type         VARCHAR(100) NOT NULL,
     payload          JSON NOT NULL,
-    status           ENUM('pending','in_flight','done','dead') NOT NULL DEFAULT 'pending',
+    status           ENUM('pending','in_flight','done','dead','waiting') NOT NULL DEFAULT 'pending',
     priority         INT NOT NULL DEFAULT 0,
     attempts         INT NOT NULL DEFAULT 0,
     max_attempts     INT NOT NULL DEFAULT 5,
@@ -51,7 +51,34 @@ EXTRA_TABLES = [
         created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+    # One row per dependency arrow: job_id waits for depends_on_id.
+    # No foreign keys on purpose (TRUNCATE in tests); integrity is kept in code.
+    """
+    CREATE TABLE IF NOT EXISTS job_dependencies (
+        job_id        BIGINT UNSIGNED NOT NULL,
+        depends_on_id BIGINT UNSIGNED NOT NULL,
+        PRIMARY KEY (job_id, depends_on_id),
+        KEY idx_depends_on (depends_on_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
 ]
+
+STATUS_COLUMN = "ENUM('pending','in_flight','done','dead','waiting') NOT NULL DEFAULT 'pending'"
+
+
+def _status_has_waiting(cur) -> bool:
+    """Does the existing table already know the 'waiting' status?"""
+    cur.execute(
+        """
+        SELECT COLUMN_TYPE AS column_type
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 'jobs' AND column_name = 'status'
+        """
+    )
+    value = cur.fetchone()["column_type"]
+    if isinstance(value, bytes):
+        value = value.decode()
+    return "'waiting'" in value
 
 # index name -> column list
 INDEXES = {
@@ -85,6 +112,9 @@ def init_db() -> None:
 
             for statement in EXTRA_TABLES:
                 cur.execute(statement)
+
+            if not _status_has_waiting(cur):
+                cur.execute(f"ALTER TABLE jobs MODIFY COLUMN status {STATUS_COLUMN}")
 
             for name in OBSOLETE_INDEXES:
                 if _index_exists(cur, name):

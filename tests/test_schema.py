@@ -62,3 +62,6 @@ def test_init_db_upgrades_a_status_column_from_an_older_version():
     init_db()                                         # the migration under test
 
     assert "'waiting'" in _status_type()
+
+def test_init_db_creates_retention_index():
+    assert "idx_retention" in _index_names()

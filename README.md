@@ -385,6 +385,26 @@ docker exec -it jobqueue-mysql mysql -uroot -prootpw -e "CREATE DATABASE IF NOT 
 GitHub Actions runs the suite on Python 3.10 and 3.12 against a real MySQL 8 service for
 every push and pull request.
 
+## Guided demo
+
+```bash
+python -m jobqueue demo
+```
+Enqueues a mix of jobs (priorities, a delayed job, a failing job, a dependency chain, a
+double-clicked payment), runs a worker, prints the queue before and after, then deletes
+only its own data. It refuses to run on a busy queue.
+
+## Retention
+
+Finished jobs are kept until you prune them:
+```bash
+python -m jobqueue prune --days 7 --dry-run   # how many would be deleted
+python -m jobqueue prune --days 7             # delete done jobs older than 7 days
+```
+Deletes in batches of 1,000 so workers are never blocked, and only touches `done` jobs.
+**Idempotency keys are deliberately kept**: they guard against duplicates by business
+identity, so how long to remember them is a business decision. Schedule `prune` with cron.
+
 ## Design notes
 - **MySQL/InnoDB** gives transactions and row-level locks, which are required for safe multi-worker locking.
 - **Schema is designed up-front** (priority, run_at, lease columns) so later phases need no migrations.

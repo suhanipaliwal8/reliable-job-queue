@@ -318,6 +318,7 @@ def main(argv=None) -> None:
                 max_attempts=args.max_attempts,
                 priority=args.priority,
                 delay_seconds=args.delay,
+                depends_on=args.depends_on,
             )
         except ValueError as exc:
             raise SystemExit(f"Error: {exc}")

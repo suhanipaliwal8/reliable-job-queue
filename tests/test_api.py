@@ -88,3 +88,11 @@ def test_invalid_limit_is_rejected_with_422():
 def test_api_is_read_only():
     assert client.post("/stats").status_code == 405
     assert client.delete("/jobs/1").status_code == 405
+
+def test_job_detail_lists_dependencies():
+    a = enqueue("email")
+    b = enqueue("t", depends_on=[a])
+
+    body = client.get(f"/jobs/{b}").json()
+    assert body["status"] == "waiting"
+    assert body["depends_on"] == [{"id": a, "job_type": "email", "status": "pending"}]

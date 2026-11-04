@@ -86,6 +86,8 @@ INDEXES = {
     "idx_claim": "(status, priority DESC, run_at)",
     # find in_flight jobs whose lease has expired
     "idx_lease": "(status, lease_expires_at)",
+    # find old finished jobs for retention (prune)
+    "idx_retention": "(status, updated_at)",
 }
 
 # indexes from earlier phases that are replaced

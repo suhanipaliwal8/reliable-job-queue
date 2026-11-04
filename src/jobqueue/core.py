@@ -331,12 +331,19 @@ def replay_dead_jobs(job_type: str | None = None) -> int:
             return cur.rowcount
 
 def _remove_orphan_dependencies(cur) -> None:
-    """Delete dependency rows whose job no longer exists."""
+    """Delete dependency rows whose job OR whose parent no longer exists.
+
+    A missing parent is safe to forget: parents are only ever deleted when
+    they are 'done' (retention) and 'done' is permanent, so it can no longer block.
+    """
     cur.execute(
         "DELETE d FROM job_dependencies d "
         "LEFT JOIN jobs j ON j.id = d.job_id WHERE j.id IS NULL"
     )
-
+    cur.execute(
+        "DELETE d FROM job_dependencies d "
+        "LEFT JOIN jobs p ON p.id = d.depends_on_id WHERE p.id IS NULL"
+    )
 
 def purge_job(job_id: int) -> bool:
     """Permanently delete ONE dead job. Never touches jobs in any other status,
@@ -444,3 +451,56 @@ def list_in_flight_jobs(limit: int = 50) -> list[dict]:
         job["lease_remaining_seconds"] = None if micros is None else round(micros / 1_000_000, 3)
         result.append(_decode_payload(job))
     return result
+
+# ---------------------------------------------------------------------------
+# Retention: delete old finished jobs
+# ---------------------------------------------------------------------------
+
+def _check_retention_args(older_than_seconds: float, batch_size: int = 1) -> None:
+    if older_than_seconds < 0:
+        raise ValueError("older_than_seconds must not be negative")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+
+
+def count_prunable_done_jobs(older_than_seconds: float) -> int:
+    """How many 'done' jobs prune_done_jobs would delete right now (dry run)."""
+    _check_retention_args(older_than_seconds)
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM jobs "
+                "WHERE status = 'done' AND updated_at < NOW(6) - INTERVAL %s SECOND",
+                (older_than_seconds,),
+            )
+            return int(cur.fetchone()["n"])
+
+
+def prune_done_jobs(older_than_seconds: float, batch_size: int = 1000) -> int:
+    """Delete 'done' jobs that finished more than `older_than_seconds` ago.
+
+    Works in small batches (one transaction each) so workers are never blocked by
+    one huge DELETE. Never touches pending, in-flight, waiting or dead jobs, and
+    never touches idempotency keys. Returns the number of jobs deleted.
+    """
+    _check_retention_args(older_than_seconds, batch_size)
+
+    total = 0
+    while True:
+        with transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM jobs WHERE status = 'done' "
+                    "AND updated_at < NOW(6) - INTERVAL %s SECOND LIMIT %s",
+                    (older_than_seconds, batch_size),
+                )
+                deleted = cur.rowcount
+        total += deleted
+        if deleted < batch_size:
+            break
+
+    if total:
+        with transaction() as conn:
+            with conn.cursor() as cur:
+                _remove_orphan_dependencies(cur)
+    return total

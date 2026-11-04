@@ -12,6 +12,7 @@ from .core import (
     replay_dead_jobs,
     replay_job,
 )
+from .chaos import ChaosError, render_report, run_chaos
 from .schema import init_db
 from .stats import get_stats, get_stats_by_type
 from .worker import Worker
@@ -178,6 +179,31 @@ def run_serve_command(args) -> None:
               "you don't trust.")
     uvicorn.run(app, host=args.host, port=args.port)
 
+def run_chaos_command(args) -> None:
+    print(f"Chaos test: {args.jobs} jobs, {args.workers} workers, up to {args.kills} "
+          f"hard kills ({'NAIVE' if args.naive else 'idempotent'} handler). "
+          "This takes a little while...")
+    try:
+        report = run_chaos(
+            jobs=args.jobs,
+            workers=args.workers,
+            kills=args.kills,
+            kill_interval=args.kill_interval,
+            step_delay=args.step_delay,
+            lease_seconds=args.lease_seconds,
+            max_attempts=args.max_attempts,
+            timeout=args.timeout,
+            naive=args.naive,
+            seed=args.seed,
+            cleanup=args.cleanup,
+        )
+    except ChaosError as exc:
+        raise SystemExit(f"Error: {exc}")
+
+    print()
+    print(render_report(report))
+    if not report["ok"]:
+        raise SystemExit(1)     # a non-zero exit code lets scripts and CI detect failure
 
 # ---------------------------------------------------------------------------
 # argument parsing
@@ -224,6 +250,24 @@ def main(argv=None) -> None:
     p_serve = sub.add_parser("serve", help="Run the read-only HTTP API")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8000)
+
+        # ---- chaos test ----
+    p_chaos = sub.add_parser("chaos", help="Hard-kill workers mid-job and verify nothing breaks")
+    p_chaos.add_argument("--jobs", type=int, default=100)
+    p_chaos.add_argument("--workers", type=int, default=4)
+    p_chaos.add_argument("--kills", type=int, default=6, help="max number of hard kills")
+    p_chaos.add_argument("--kill-interval", type=float, default=1.0,
+                         help="average seconds between kills")
+    p_chaos.add_argument("--step-delay", type=float, default=0.1,
+                         help="pause between a job's steps (the kill window), in seconds")
+    p_chaos.add_argument("--lease-seconds", type=float, default=3.0)
+    p_chaos.add_argument("--max-attempts", type=int, default=50)
+    p_chaos.add_argument("--timeout", type=float, default=120.0)
+    p_chaos.add_argument("--naive", action="store_true",
+                         help="use the BROKEN handler (no idempotency) to see the failure")
+    p_chaos.add_argument("--seed", type=int, default=None, help="repeatable kill schedule")
+    p_chaos.add_argument("--cleanup", action="store_true",
+                         help="delete this run's rows afterwards")
 
     # ---- dead-letter queue ----
     p_dead = sub.add_parser("dead", help="Inspect, replay or purge dead jobs")
@@ -282,3 +326,5 @@ def main(argv=None) -> None:
         run_serve_command(args)
     elif args.command == "dead":
         run_dead_command(args)
+    elif args.command == "chaos":
+        run_chaos_command(args)

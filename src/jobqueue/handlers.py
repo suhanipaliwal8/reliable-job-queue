@@ -86,3 +86,44 @@ def charge_and_receipt(job):
     run_once(f"charge:{order}", lambda cur: _insert_charge(cur, payload), job["id"])
     _simulate_trouble_between_steps(job)
     run_once(f"receipt:{order}", lambda cur: _insert_receipt(cur, payload), job["id"])
+
+# ---------------------------------------------------------------------------
+# Chaos-test handlers (Phase 8): a slow two-step job, so hard kills land mid-job
+# ---------------------------------------------------------------------------
+
+def _chaos_order(job, idempotent: bool):
+    payload = job["payload"]
+    order = payload["order_id"]
+    pause = float(payload.get("step_delay", 0.1))
+
+    # Step 1: charge
+    if idempotent:
+        run_once(f"charge:{order}", lambda cur: _insert_charge(cur, payload), job["id"])
+    else:
+        with transaction() as conn:
+            with conn.cursor() as cur:
+                _insert_charge(cur, payload)
+
+    time.sleep(pause)        # kill window 1: charged, receipt not sent yet
+
+    # Step 2: receipt
+    if idempotent:
+        run_once(f"receipt:{order}", lambda cur: _insert_receipt(cur, payload), job["id"])
+    else:
+        with transaction() as conn:
+            with conn.cursor() as cur:
+                _insert_receipt(cur, payload)
+
+    time.sleep(pause / 2)    # kill window 2: every effect done, job not yet marked done
+
+
+@handler("chaos_order")
+def chaos_order(job):
+    """Safe: every step is guarded by an idempotency key."""
+    _chaos_order(job, idempotent=True)
+
+
+@handler("chaos_order_naive")
+def chaos_order_naive(job):
+    """BROKEN ON PURPOSE: no idempotency keys. A kill + retry applies effects twice."""
+    _chaos_order(job, idempotent=False)

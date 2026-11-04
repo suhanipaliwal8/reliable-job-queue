@@ -1,10 +1,14 @@
 import pymysql
 from fastapi import FastAPI, HTTPException, Query
+import secrets
 
 from . import __version__
 from .core import get_job, list_dead_jobs, list_in_flight_jobs, list_dependencies
 from .db import transaction
 from .stats import get_stats, get_stats_by_type
+from pathlib import Path
+
+from fastapi.responses import HTMLResponse
 
 app = FastAPI(
     title="Reliable Job Queue",
@@ -14,6 +18,25 @@ app = FastAPI(
 
 # NOTE: these are plain `def`, not `async def`. Our DB driver blocks, and FastAPI
 # runs plain `def` endpoints in a thread pool so one slow query can't freeze the server.
+
+DASHBOARD_FILE = Path(__file__).parent / "static" / "dashboard.html"
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def dashboard():
+    """The live dashboard. A fresh random nonce is put into the page and into the
+    Content-Security-Policy header, so the browser runs ONLY our own inline
+    script/style and refuses anything injected, and may talk only to this server."""
+    nonce = secrets.token_urlsafe(16)
+    html = DASHBOARD_FILE.read_text(encoding="utf-8").replace("__NONCE__", nonce)
+    headers = {
+        "Content-Security-Policy": (
+            f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+            "connect-src 'self'; base-uri 'none'; form-action 'none'"
+        ),
+        "Cache-Control": "no-store",
+    }
+    return HTMLResponse(html, headers=headers)
 
 
 @app.get("/health")

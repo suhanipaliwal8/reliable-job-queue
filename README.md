@@ -3,7 +3,7 @@
 A background-job engine built from scratch in Python + MySQL.
 No Celery, no Sidekiq: just SQL, transactions, and careful design.
 
-> Status: ✅ Phase 6 complete (idempotency) → next: Phase 7 (inspect CLI + API)
+> Status: ✅ Phase 7 complete (inspect CLI + API) → next: Phase 8 (crash demo)
 
 ## Features (planned)
 - Durable queue: jobs survive crashes and restarts
@@ -25,7 +25,7 @@ docker compose up -d
 # 2. Install
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -e ".[dev,api]"
 
 # 3. Create tables and add jobs
 python -m jobqueue init-db
@@ -226,10 +226,54 @@ python -m jobqueue worker --backoff-base 1
   to the provider too (e.g. Stripe's `Idempotency-Key` header).
 - `side_effects` grows forever; a production system would expire old keys.
 
+## Inspecting the queue
+
+```bash
+python -m jobqueue stats                # queue depth and health
+python -m jobqueue stats --by-type      # ...broken down per job type
+python -m jobqueue stats --json         # machine-readable
+python -m jobqueue in-flight            # who holds which job, lease time left
+python -m jobqueue dead list            # dead-letter contents (Phase 5)
+```
+
+### What the numbers mean
+| Field | Meaning | Worry when |
+|---|---|---|
+| `pending_ready` | Waiting and due now (the backlog) | keeps growing |
+| `pending_scheduled` | Waiting for a future `run_at` (delays, retry backoff) | n/a |
+| `oldest_ready_age_seconds` | How long the longest-waiting ready job has waited (**latency**) | keeps growing |
+| `in_flight_active` | Held by a worker, lease still valid | n/a |
+| `in_flight_expired` | Lease ran out: worker died **or is just slow** | stays above 0 |
+| `dead` | Jobs that exhausted their retries | above 0 |
+
+Depth alone can mislead: 1,000 jobs that drain in a second are fine, 3 jobs that have
+waited 20 minutes are not. Watch latency too.
+
+### HTTP API (read-only)
+```bash
+python -m jobqueue serve        # http://127.0.0.1:8000  (interactive docs at /docs)
+```
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | `200` if the API can reach the database, else `503` |
+| `GET /stats` | the numbers above |
+| `GET /stats/by-type` | counts per job type |
+| `GET /jobs/in-flight?limit=` | jobs held by workers, with `lease_remaining_seconds` |
+| `GET /jobs/dead?limit=&job_type=` | dead-letter contents with `last_error` |
+| `GET /jobs/{id}` | one job (`404` if missing) |
+
+
 ## Design notes
 - **MySQL/InnoDB** gives transactions and row-level locks, which are required for safe multi-worker locking.
 - **Schema is designed up-front** (priority, run_at, lease columns) so later phases need no migrations.
 - **Config via environment variables** so the same code runs anywhere.
+- **One SQL statement, one snapshot.** All counts come from a single query using
+  conditional aggregation, so they can't contradict each other mid-count.
+- **Database clock** for every age and countdown, like leases and delays.
+- **Read-only on purpose.** The API has no authentication, so it cannot replay or purge.
+  Those stay in the CLI. It binds to `127.0.0.1` by default; don't expose it publicly.
+- **Limit:** `stats` scans the table. With millions of finished jobs you would add
+  retention (delete old `done` jobs) or maintain counters.
 
 ### Other design notes
 - Time comes from the database clock (`NOW(6)`), never from worker machines.
@@ -246,5 +290,5 @@ python -m jobqueue worker --backoff-base 1
 - [x] Phase 4: Retry + exponential backoff
 - [x] Phase 5: Dead-letter queue + replay
 - [x] Phase 6: Idempotency
-- [ ] Phase 7: Inspect CLI + API
+- [x] Phase 7: Inspect CLI + API
 - [ ] Phase 8: Crash demo

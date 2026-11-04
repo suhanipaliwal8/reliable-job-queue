@@ -6,12 +6,14 @@ from .core import (
     enqueue,
     get_job,
     list_dead_jobs,
+    list_in_flight_jobs,
     purge_dead_jobs,
     purge_job,
     replay_dead_jobs,
     replay_job,
 )
 from .schema import init_db
+from .stats import get_stats, get_stats_by_type
 from .worker import Worker
 
 
@@ -24,6 +26,10 @@ def parse_key_values(pairs: list[str]) -> dict:
         data[key] = value
     return data
 
+
+# ---------------------------------------------------------------------------
+# dead-letter queue commands
+# ---------------------------------------------------------------------------
 
 def run_dead_command(args) -> None:
     """Handle `jobqueue dead list|replay|purge`."""
@@ -72,6 +78,111 @@ def run_dead_command(args) -> None:
             raise SystemExit("Error: give a job id or --all")
 
 
+# ---------------------------------------------------------------------------
+# inspection commands
+# ---------------------------------------------------------------------------
+
+def format_seconds(value) -> str:
+    return "-" if value is None else f"{value:.1f}s"
+
+
+def render_stats(stats: dict) -> str:
+    rows = [
+        ("pending, ready now", stats["pending_ready"]),
+        ("pending, scheduled", stats["pending_scheduled"]),
+        ("in flight, lease valid", stats["in_flight_active"]),
+        ("in flight, lease expired", stats["in_flight_expired"]),
+        ("done", stats["done"]),
+        ("dead", stats["dead"]),
+        ("total", stats["total"]),
+    ]
+    lines = ["QUEUE HEALTH"]
+    lines += [f"  {label:<26}{value:>8}" for label, value in rows]
+    lines.append("")
+    oldest = format_seconds(stats["oldest_ready_age_seconds"])
+    upcoming = format_seconds(stats["next_scheduled_in_seconds"])
+    lines.append(f"  {'oldest ready job waiting':<26}{oldest:>8}")
+    lines.append(f"  {'next scheduled job in':<26}{upcoming:>8}")
+
+    if stats["in_flight_expired"]:
+        lines += [
+            "",
+            "! Some leases have expired. A worker may have died (or is just slow);",
+            "  another worker will reclaim these jobs on its next poll.",
+        ]
+    if stats["dead"]:
+        lines += ["", "! Dead jobs need attention: python -m jobqueue dead list"]
+    return "\n".join(lines)
+
+
+def render_by_type(rows: list[dict]) -> str:
+    if not rows:
+        return "No jobs yet."
+    lines = [f"{'TYPE':<24}{'PENDING':>9}{'IN FLIGHT':>11}{'DONE':>8}{'DEAD':>7}"]
+    for row in rows:
+        lines.append(f"{row['job_type']:<24}{row['pending']:>9}{row['in_flight']:>11}"
+                     f"{row['done']:>8}{row['dead']:>7}")
+    return "\n".join(lines)
+
+
+def run_stats_command(args) -> None:
+    stats = get_stats()
+    # The per-type table is a second query, so on a very busy queue its numbers
+    # can differ from the totals by a job or two.
+    rows = get_stats_by_type() if args.by_type else None
+
+    if args.json:
+        data = {**stats, "by_type": rows} if rows is not None else stats
+        print(json.dumps(data, indent=2))
+        return
+
+    print(render_stats(stats))
+    if rows is not None:
+        print()
+        print(render_by_type(rows))
+
+
+def run_in_flight_command(args) -> None:
+    try:
+        jobs = list_in_flight_jobs(limit=args.limit)
+    except ValueError as exc:
+        raise SystemExit(f"Error: {exc}")
+    if not jobs:
+        print("No jobs are in flight.")
+        return
+
+    print(f"{'ID':>6}  {'TYPE':<20} {'WORKER':<32} {'TRY':>5}  LEASE")
+    for job in jobs:
+        left = job["lease_remaining_seconds"]
+        if left is None:
+            lease = "-"
+        elif left >= 0:
+            lease = f"{left:.1f}s left"
+        else:
+            lease = f"EXPIRED {-left:.1f}s ago"
+        tries = f"{job['attempts']}/{job['max_attempts']}"
+        print(f"{job['id']:>6}  {job['job_type']:<20} {(job['locked_by'] or '-'):<32} "
+              f"{tries:>5}  {lease}")
+
+
+def run_serve_command(args) -> None:
+    try:
+        import uvicorn
+        from .api import app
+    except ImportError as exc:
+        raise SystemExit(
+            f'The API needs extra packages ({exc}). Run: pip install -e ".[api]"'
+        )
+    if args.host not in ("127.0.0.1", "localhost"):
+        print("WARNING: the API has no authentication. Do not expose it to a network "
+              "you don't trust.")
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+# ---------------------------------------------------------------------------
+# argument parsing
+# ---------------------------------------------------------------------------
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="jobqueue", description="Reliable job queue")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -100,6 +211,19 @@ def main(argv=None) -> None:
                           help="maximum retry delay in seconds")
     p_worker.add_argument("--drain", action="store_true",
                           help="exit when no job is currently due")
+
+    # ---- inspection ----
+    p_stats = sub.add_parser("stats", help="Show queue depth and health")
+    p_stats.add_argument("--json", action="store_true", help="machine-readable output")
+    p_stats.add_argument("--by-type", action="store_true",
+                         help="also break the counts down per job type")
+
+    p_inflight = sub.add_parser("in-flight", help="Show jobs currently held by workers")
+    p_inflight.add_argument("--limit", type=int, default=50)
+
+    p_serve = sub.add_parser("serve", help="Run the read-only HTTP API")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8000)
 
     # ---- dead-letter queue ----
     p_dead = sub.add_parser("dead", help="Inspect, replay or purge dead jobs")
@@ -150,5 +274,11 @@ def main(argv=None) -> None:
             worker.run_forever(drain=args.drain)
         except KeyboardInterrupt:
             print("\nWorker stopped.")
+    elif args.command == "stats":
+        run_stats_command(args)
+    elif args.command == "in-flight":
+        run_in_flight_command(args)
+    elif args.command == "serve":
+        run_serve_command(args)
     elif args.command == "dead":
         run_dead_command(args)

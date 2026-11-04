@@ -3,7 +3,7 @@
 A background-job engine built from scratch in Python + MySQL.
 No Celery, no Sidekiq: just SQL, transactions, and careful design.
 
-> Status: ✅ Phase 8 complete (crash demo) → next: Phase 9 (stretch goals)
+> Status: ✅ Phase 9a complete (job dependencies)
 
 ## Features (planned)
 - Durable queue: jobs survive crashes and restarts
@@ -245,6 +245,8 @@ python -m jobqueue dead list            # dead-letter contents (Phase 5)
 | `in_flight_active` | Held by a worker, lease still valid | n/a |
 | `in_flight_expired` | Lease ran out: worker died **or is just slow** | stays above 0 |
 | `dead` | Jobs that exhausted their retries | above 0 |
+| `waiting` | held back until dependencies are done | |
+| `waiting_blocked` | waiting on a dead job (needs a human) | |
 
 Depth alone can mislead: 1,000 jobs that drain in a second are fine, 3 jobs that have
 waited 20 minutes are not. Watch latency too.
@@ -309,7 +311,40 @@ Notes:
 - `--seed` repeats the kill schedule, not the exact outcome (timing is up to the OS).
 - It kills workers only, not MySQL or the network.
 
+## Job dependencies
 
+Run job B only after job A has succeeded:
+
+```bash
+python -m jobqueue enqueue charge_and_receipt order_id=A1 customer=asha amount_cents=499     # -> job 1
+python -m jobqueue enqueue send_email to=asha@b.com --depends-on 1                           # -> job 2 (waiting)
+python -m jobqueue enqueue send_email to=boss@b.com --depends-on 1 --depends-on 2            # waits for both
+python -m jobqueue show 2          # status + the jobs it depends on
+python -m jobqueue cancel 3        # remove a waiting job nothing depends on
+```
+
+Lifecycle: `waiting → pending → in_flight → done`. A job starts as `waiting` if any
+dependency is not `done` yet. Workers never claim `waiting` jobs.
+
+How it works:
+- `job_dependencies(job_id, depends_on_id)` holds the arrows.
+- **No cycles are possible**: dependencies are set at enqueue time and must already
+  exist, so an arrow can only point to an older job.
+- `complete_job` releases dependents **in the same transaction** that marks the job
+  done: either both happen or neither does.
+- Two races are handled with row locks: enqueue vs. completion (so a job can't wait
+  forever on something that already finished), and two dependencies finishing at the
+  same moment (each dependent is locked before it is checked).
+- On release, `run_at = GREATEST(run_at, NOW())`, so waiting time is not reported as
+  queue latency. A job with both `--delay` and a dependency waits for both.
+
+Failure handling:
+- If a dependency fails and retries, dependents keep waiting.
+- If a dependency goes **dead**, dependents stay `waiting` (shown as *blocked* in
+  `stats`). Replay the dead job and its dependents are released automatically once it
+  succeeds, or `cancel` them.
+- A dead job that others depend on cannot be purged. Cancel the dependents first.
+- Integrity is kept in code, not with foreign keys, because tests use `TRUNCATE`.
 
 ## Design notes
 - **MySQL/InnoDB** gives transactions and row-level locks, which are required for safe multi-worker locking.
@@ -340,5 +375,5 @@ Notes:
 - [x] Phase 6: Idempotency
 - [x] Phase 7: Inspect CLI + API
 - [x] Phase 8: Crash demo
-- [ ] Phase 9: Stretch (job dependencies, dashboard)
+- [x] Phase 9: Stretch (job dependencies, dashboard)
 - [ ] Phase 10: Polish

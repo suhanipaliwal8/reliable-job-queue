@@ -74,8 +74,8 @@ def test_stats_by_type_groups_counts(make_dead_job):
     enqueue("sms")
 
     assert get_stats_by_type() == [
-        {"job_type": "email", "pending": 1, "in_flight": 0, "done": 0, "dead": 1},
-        {"job_type": "sms", "pending": 1, "in_flight": 0, "done": 0, "dead": 0},
+        {"job_type": "email", "pending": 1, "waiting": 0, "in_flight": 0, "done": 0, "dead": 1},
+        {"job_type": "sms", "pending": 1, "waiting": 0, "in_flight": 0, "done": 0, "dead": 0},
     ]
 
 
@@ -119,3 +119,15 @@ def test_in_flight_jobs_are_sorted_by_soonest_expiry():
 def test_in_flight_limit_must_be_positive():
     with pytest.raises(ValueError):
         list_in_flight_jobs(limit=0)
+
+def test_stats_count_waiting_and_blocked_jobs(make_dead_job):
+    dead_id = make_dead_job()
+    enqueue("t", depends_on=[dead_id])        # waiting, blocked by a dead job
+    root = enqueue("t")
+    enqueue("t", depends_on=[root])           # waiting, but healthy
+
+    stats = get_stats()
+    assert stats["waiting"] == 2
+    assert stats["waiting_blocked"] == 1
+    assert stats["pending_ready"] == 1
+    assert stats["total"] == 4

@@ -3,9 +3,11 @@ import json
 import logging
 
 from .core import (
+    cancel_job,
     enqueue,
     get_job,
     list_dead_jobs,
+    list_dependencies,
     list_in_flight_jobs,
     purge_dead_jobs,
     purge_job,
@@ -91,6 +93,7 @@ def render_stats(stats: dict) -> str:
     rows = [
         ("pending, ready now", stats["pending_ready"]),
         ("pending, scheduled", stats["pending_scheduled"]),
+        ("waiting on dependencies", stats["waiting"]),
         ("in flight, lease valid", stats["in_flight_active"]),
         ("in flight, lease expired", stats["in_flight_expired"]),
         ("done", stats["done"]),
@@ -113,16 +116,23 @@ def render_stats(stats: dict) -> str:
         ]
     if stats["dead"]:
         lines += ["", "! Dead jobs need attention: python -m jobqueue dead list"]
+    if stats["waiting_blocked"]:
+        lines += [
+            "",
+            f"! {stats['waiting_blocked']} waiting job(s) depend on a dead job.",
+            "  Replay the dead job (python -m jobqueue dead list)",
+            "  or cancel the waiting job (python -m jobqueue cancel <id>).",
+        ]
     return "\n".join(lines)
 
 
 def render_by_type(rows: list[dict]) -> str:
     if not rows:
         return "No jobs yet."
-    lines = [f"{'TYPE':<24}{'PENDING':>9}{'IN FLIGHT':>11}{'DONE':>8}{'DEAD':>7}"]
+    lines = [f"{'TYPE':<24}{'PENDING':>9}{'WAITING':>9}{'IN FLIGHT':>11}{'DONE':>8}{'DEAD':>7}"]
     for row in rows:
-        lines.append(f"{row['job_type']:<24}{row['pending']:>9}{row['in_flight']:>11}"
-                     f"{row['done']:>8}{row['dead']:>7}")
+        lines.append(f"{row['job_type']:<24}{row['pending']:>9}{row['waiting']:>9}"
+                     f"{row['in_flight']:>11}{row['done']:>8}{row['dead']:>7}")
     return "\n".join(lines)
 
 
@@ -224,8 +234,14 @@ def main(argv=None) -> None:
     p_enqueue.add_argument("--delay", type=float, default=0,
                            help="seconds to wait before the job becomes runnable")
 
+    p_enqueue.add_argument("--depends-on", type=int, action="append", metavar="JOB_ID",
+                           help="wait for this job to finish first (repeat for several)")
+
     p_show = sub.add_parser("show", help="Show one job")
     p_show.add_argument("job_id", type=int)
+
+    p_cancel = sub.add_parser("cancel", help="Delete a waiting job that nothing depends on")
+    p_cancel.add_argument("job_id", type=int)
 
     p_worker = sub.add_parser("worker", help="Run a worker that processes jobs")
     p_worker.add_argument("--worker-id", default=None)
@@ -302,12 +318,15 @@ def main(argv=None) -> None:
                 max_attempts=args.max_attempts,
                 priority=args.priority,
                 delay_seconds=args.delay,
+                depends_on=args.depends_on,
             )
         except ValueError as exc:
             raise SystemExit(f"Error: {exc}")
         print(f"Enqueued job {job_id}")
     elif args.command == "show":
         job = get_job(args.job_id)
+        if job:
+            job["depends_on"] = list_dependencies(args.job_id)
         print(json.dumps(job, indent=2, default=str) if job else "Job not found")
     elif args.command == "worker":
         logging.basicConfig(level=logging.INFO,
@@ -328,3 +347,10 @@ def main(argv=None) -> None:
         run_dead_command(args)
     elif args.command == "chaos":
         run_chaos_command(args)
+    elif args.command == "cancel":
+        if cancel_job(args.job_id):
+            print(f"Job {args.job_id} cancelled.")
+        else:
+            raise SystemExit(
+                f"Job {args.job_id} not found, not waiting, or other jobs depend on it."
+            )

@@ -15,12 +15,16 @@ def enqueue(
     max_attempts: int = 5,
     priority: int = 0,
     delay_seconds: float = 0,
+    depends_on: list[int] | None = None,
 ) -> int:
     """Add a job to the queue. Returns the new job's id.
 
     priority:      higher number = more urgent (default 0, negatives allowed).
     delay_seconds: the job will not run before NOW + this many seconds
                    (measured by the DATABASE clock).
+    depends_on:    ids of jobs that must be 'done' first. If any of them is not
+                   done yet, the job starts as 'waiting'. Dependencies must
+                   already exist, which is what makes cycles impossible.
     """
     if not job_type:
         raise ValueError("job_type must not be empty")
@@ -29,19 +33,43 @@ def enqueue(
     if delay_seconds < 0:
         raise ValueError("delay_seconds must not be negative")
     payload = payload or {}
+    dependency_ids = sorted(set(depends_on or []))
 
     with transaction() as conn:
         with conn.cursor() as cur:
+            status = "pending"
+            if dependency_ids:
+                # Lock the dependency rows (in id order, to avoid deadlocks) so a
+                # dependency can't finish between our check and our INSERT.
+                marks = ", ".join(["%s"] * len(dependency_ids))
+                cur.execute(
+                    f"SELECT id, status FROM jobs WHERE id IN ({marks}) ORDER BY id FOR UPDATE",
+                    tuple(dependency_ids),
+                )
+                found = {row["id"]: row["status"] for row in cur.fetchall()}
+                missing = [i for i in dependency_ids if i not in found]
+                if missing:
+                    raise ValueError(f"depends_on refers to unknown job id(s): {missing}")
+                if any(s != "done" for s in found.values()):
+                    status = "waiting"
+
             cur.execute(
                 """
-                INSERT INTO jobs (job_type, payload, max_attempts, priority, run_at)
-                VALUES (%s, %s, %s, %s, NOW(6) + INTERVAL %s SECOND)
+                INSERT INTO jobs (job_type, payload, max_attempts, priority, status, run_at)
+                VALUES (%s, %s, %s, %s, %s, NOW(6) + INTERVAL %s SECOND)
                 """,
-                (job_type, json.dumps(payload), max_attempts, priority, delay_seconds),
+                (job_type, json.dumps(payload), max_attempts, priority, status, delay_seconds),
             )
-            return cur.lastrowid
+            job_id = cur.lastrowid
 
+            if dependency_ids:
+                cur.executemany(
+                    "INSERT INTO job_dependencies (job_id, depends_on_id) VALUES (%s, %s)",
+                    [(job_id, dep) for dep in dependency_ids],
+                )
+            return job_id
 
+        
 def get_job(job_id: int) -> dict | None:
     """Fetch one job by id, or None if it doesn't exist."""
     with transaction() as conn:
@@ -112,8 +140,50 @@ def claim_job(worker_id: str, lease_seconds: float = 30) -> dict | None:
                 return _decode_payload(job)
             
 
+def _release_dependents(cur, finished_job_id: int) -> int:
+    """After a job finishes, move each waiting dependent to 'pending' if ALL of
+    its dependencies are now done. Runs inside the caller's transaction.
+
+    Each dependent is locked BEFORE we check it. Without that, two dependencies
+    finishing at the same moment would each see the other as unfinished (the
+    other's change is not committed yet), and the dependent would wait forever.
+    """
+    cur.execute(
+        "SELECT job_id FROM job_dependencies WHERE depends_on_id = %s ORDER BY job_id",
+        (finished_job_id,),
+    )
+    released = 0
+    for row in cur.fetchall():
+        dependent_id = row["job_id"]
+
+        cur.execute("SELECT status FROM jobs WHERE id = %s FOR UPDATE", (dependent_id,))
+        dependent = cur.fetchone()
+        if dependent is None or dependent["status"] != "waiting":
+            continue
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM job_dependencies d
+            JOIN jobs p ON p.id = d.depends_on_id
+            WHERE d.job_id = %s AND p.status <> 'done'
+            """,
+            (dependent_id,),
+        )
+        if cur.fetchone()["n"] == 0:
+            # GREATEST: waiting time must not count as queue latency.
+            cur.execute(
+                "UPDATE jobs SET status = 'pending', run_at = GREATEST(run_at, NOW(6)) "
+                "WHERE id = %s",
+                (dependent_id,),
+            )
+            released += 1
+    return released
+
+
 def complete_job(job_id: int, worker_id: str) -> bool:
-    """Mark a job done. Returns False if this worker no longer owns the job."""
+    """Mark a job done and release any jobs that were waiting for it.
+    Returns False if this worker no longer owns the job."""
     with transaction() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -124,9 +194,12 @@ def complete_job(job_id: int, worker_id: str) -> bool:
                 """,
                 (job_id, worker_id),
             )
-            return cur.rowcount == 1
+            if cur.rowcount != 1:
+                return False
+            _release_dependents(cur, job_id)
+            return True
 
-
+        
 def fail_job(
     job_id: int,
     worker_id: str,
@@ -257,20 +330,42 @@ def replay_dead_jobs(job_type: str | None = None) -> int:
             cur.execute(sql, params)
             return cur.rowcount
 
+def _remove_orphan_dependencies(cur) -> None:
+    """Delete dependency rows whose job no longer exists."""
+    cur.execute(
+        "DELETE d FROM job_dependencies d "
+        "LEFT JOIN jobs j ON j.id = d.job_id WHERE j.id IS NULL"
+    )
+
 
 def purge_job(job_id: int) -> bool:
-    """Permanently delete ONE dead job. Never touches jobs in any other status."""
+    """Permanently delete ONE dead job. Never touches jobs in any other status,
+    and refuses a job that other jobs still depend on."""
     with transaction() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM jobs WHERE id = %s AND status = 'dead'", (job_id,)
+                """
+                DELETE FROM jobs
+                WHERE id = %s AND status = 'dead'
+                  AND NOT EXISTS (SELECT 1 FROM job_dependencies d
+                                  WHERE d.depends_on_id = jobs.id)
+                """,
+                (job_id,),
             )
-            return cur.rowcount == 1
+            deleted = cur.rowcount == 1
+            if deleted:
+                _remove_orphan_dependencies(cur)
+            return deleted
 
 
 def purge_dead_jobs(job_type: str | None = None) -> int:
-    """Permanently delete all dead jobs (optionally one job type). Returns the count."""
-    sql = "DELETE FROM jobs WHERE status = 'dead'"
+    """Permanently delete dead jobs (optionally one job type), except those that
+    other jobs depend on. Returns the count."""
+    sql = """
+        DELETE FROM jobs
+        WHERE status = 'dead'
+          AND NOT EXISTS (SELECT 1 FROM job_dependencies d WHERE d.depends_on_id = jobs.id)
+    """
     params: list = []
     if job_type:
         sql += " AND job_type = %s"
@@ -279,7 +374,46 @@ def purge_dead_jobs(job_type: str | None = None) -> int:
     with transaction() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
-            return cur.rowcount
+            deleted = cur.rowcount
+            _remove_orphan_dependencies(cur)
+            return deleted
+
+
+def cancel_job(job_id: int) -> bool:
+    """Delete a WAITING job that no other job depends on.
+    To cancel a whole chain, cancel from the end of the chain backwards."""
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM jobs
+                WHERE id = %s AND status = 'waiting'
+                  AND NOT EXISTS (SELECT 1 FROM job_dependencies d
+                                  WHERE d.depends_on_id = jobs.id)
+                """,
+                (job_id,),
+            )
+            cancelled = cur.rowcount == 1
+            if cancelled:
+                _remove_orphan_dependencies(cur)
+            return cancelled
+
+
+def list_dependencies(job_id: int) -> list[dict]:
+    """The jobs this job waits for, with their current status."""
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.id, p.job_type, p.status
+                FROM job_dependencies d
+                JOIN jobs p ON p.id = d.depends_on_id
+                WHERE d.job_id = %s
+                ORDER BY p.id
+                """,
+                (job_id,),
+            )
+            return list(cur.fetchall())
 
 def list_in_flight_jobs(limit: int = 50) -> list[dict]:
     """Jobs currently held by workers, soonest-expiring lease first.

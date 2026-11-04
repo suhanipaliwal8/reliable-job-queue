@@ -59,6 +59,6 @@ def clean_tables():
     init_db()
     with transaction() as conn:
         with conn.cursor() as cur:
-            for table in ("jobs", "side_effects", "charges", "receipts"):
+            for table in ("jobs", "job_dependencies", "side_effects", "charges", "receipts"):
                 cur.execute(f"TRUNCATE TABLE {table}")
     yield

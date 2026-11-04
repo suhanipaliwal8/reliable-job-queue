@@ -2,7 +2,7 @@ import pymysql
 from fastapi import FastAPI, HTTPException, Query
 
 from . import __version__
-from .core import get_job, list_dead_jobs, list_in_flight_jobs
+from .core import get_job, list_dead_jobs, list_in_flight_jobs, list_dependencies
 from .db import transaction
 from .stats import get_stats, get_stats_by_type
 
@@ -55,4 +55,5 @@ def job_detail(job_id: int):
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    job["depends_on"] = list_dependencies(job_id)
     return job

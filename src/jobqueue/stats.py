@@ -1,11 +1,17 @@
 from .db import transaction
 
 # ONE statement = ONE consistent snapshot. SUM(<condition>) counts matching rows.
-# COALESCE turns "no rows at all" (NULL) into 0.
+# 'waiting_blocked' = waiting jobs that depend on a DEAD job (they cannot proceed
+# until a human replays that job).
 STATS_SQL = """
 SELECT
     COALESCE(SUM(status = 'pending'   AND run_at <= NOW(6)), 0)            AS pending_ready,
     COALESCE(SUM(status = 'pending'   AND run_at >  NOW(6)), 0)            AS pending_scheduled,
+    COALESCE(SUM(status = 'waiting'), 0)                                   AS waiting,
+    COALESCE(SUM(status = 'waiting' AND EXISTS (
+        SELECT 1 FROM job_dependencies d
+        JOIN jobs p ON p.id = d.depends_on_id
+        WHERE d.job_id = j.id AND p.status = 'dead')), 0)                  AS waiting_blocked,
     COALESCE(SUM(status = 'in_flight' AND lease_expires_at >  NOW(6)), 0)  AS in_flight_active,
     COALESCE(SUM(status = 'in_flight' AND lease_expires_at <= NOW(6)), 0)  AS in_flight_expired,
     COALESCE(SUM(status = 'done'), 0)                                      AS done,
@@ -16,13 +22,14 @@ SELECT
     TIMESTAMPDIFF(MICROSECOND, NOW(6),
         MIN(CASE WHEN status = 'pending' AND run_at > NOW(6) THEN run_at END))
                                                                            AS next_scheduled_micros
-FROM jobs
+FROM jobs AS j
 """
 
 BY_TYPE_SQL = """
 SELECT
     job_type,
     COALESCE(SUM(status = 'pending'), 0)   AS pending,
+    COALESCE(SUM(status = 'waiting'), 0)   AS waiting,
     COALESCE(SUM(status = 'in_flight'), 0) AS in_flight,
     COALESCE(SUM(status = 'done'), 0)      AS done,
     COALESCE(SUM(status = 'dead'), 0)      AS dead
@@ -39,9 +46,11 @@ def _seconds(micros) -> float | None:
 def get_stats() -> dict:
     """Queue health in one consistent snapshot.
 
-    pending            all jobs waiting (ready + scheduled)
-    pending_ready      waiting AND due now: the real backlog
-    pending_scheduled  waiting for a future time (delayed jobs, retry backoff)
+    pending            all jobs waiting to run (ready + scheduled)
+    pending_ready      pending AND due now: the real backlog
+    pending_scheduled  pending for a future time (delays, retry backoff)
+    waiting            held back until their dependencies are done
+    waiting_blocked    waiting jobs that depend on a DEAD job (subset of waiting)
     in_flight_active   held by a worker, lease still valid
     in_flight_expired  lease ran out: worker died or is very slow
     oldest_ready_age_seconds   how long the longest-waiting ready job has waited
@@ -52,15 +61,18 @@ def get_stats() -> dict:
             cur.execute(STATS_SQL)
             row = cur.fetchone()
 
+    # The seven states are disjoint, so they add up to the total.
     counts = {
         key: int(row[key])
-        for key in ("pending_ready", "pending_scheduled", "in_flight_active",
+        for key in ("pending_ready", "pending_scheduled", "waiting", "in_flight_active",
                     "in_flight_expired", "done", "dead")
     }
     return {
         "pending": counts["pending_ready"] + counts["pending_scheduled"],
         "pending_ready": counts["pending_ready"],
         "pending_scheduled": counts["pending_scheduled"],
+        "waiting": counts["waiting"],
+        "waiting_blocked": int(row["waiting_blocked"]),
         "in_flight": counts["in_flight_active"] + counts["in_flight_expired"],
         "in_flight_active": counts["in_flight_active"],
         "in_flight_expired": counts["in_flight_expired"],
@@ -82,6 +94,7 @@ def get_stats_by_type() -> list[dict]:
         {
             "job_type": row["job_type"],
             "pending": int(row["pending"]),
+            "waiting": int(row["waiting"]),
             "in_flight": int(row["in_flight"]),
             "done": int(row["done"]),
             "dead": int(row["dead"]),

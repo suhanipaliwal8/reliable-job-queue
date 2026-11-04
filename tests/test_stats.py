@@ -74,8 +74,8 @@ def test_stats_by_type_groups_counts(make_dead_job):
     enqueue("sms")
 
     assert get_stats_by_type() == [
-        {"job_type": "email", "pending": 1, "in_flight": 0, "done": 0, "dead": 1},
-        {"job_type": "sms", "pending": 1, "in_flight": 0, "done": 0, "dead": 0},
+        {"job_type": "email", "pending": 1, "waiting": 0, "in_flight": 0, "done": 0, "dead": 1},
+        {"job_type": "sms", "pending": 1, "waiting": 0, "in_flight": 0, "done": 0, "dead": 0},
     ]
 
 

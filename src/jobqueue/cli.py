@@ -188,6 +188,7 @@ def run_serve_command(args) -> None:
         print("WARNING: the API has no authentication. Do not expose it to a network "
               "you don't trust.")
     uvicorn.run(app, host=args.host, port=args.port)
+    print(f"Dashboard: http://{args.host}:{args.port}/    API docs: http://{args.host}:{args.port}/docs")
 
 def run_chaos_command(args) -> None:
     print(f"Chaos test: {args.jobs} jobs, {args.workers} workers, up to {args.kills} "

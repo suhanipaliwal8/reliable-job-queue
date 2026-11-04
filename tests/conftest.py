@@ -86,3 +86,15 @@ def make_dead_job():
         return job_id
 
     return _make
+
+@pytest.fixture
+def age_job():
+    """Return a function that pretends a job was last updated `seconds` ago."""
+    def _age(job_id, seconds):
+        with transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE jobs SET updated_at = NOW(6) - INTERVAL %s SECOND WHERE id = %s",
+                    (seconds, job_id),
+                )
+    return _age

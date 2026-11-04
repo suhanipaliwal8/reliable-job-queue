@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Queue Dashboard</title>
+<style nonce="__NONCE__">
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --text: #1c2230; --muted: #667085; --line: #e3e6ec;
+  --ok: #12805c; --warn: #b26a00; --bad: #c0262d; --accent: #2f5fd0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151c; --card: #1b2030; --text: #e8ebf2; --muted: #9aa3b5; --line: #2b3246;
+    --ok: #3ecf9a; --warn: #f0b04a; --bad: #ff6b72; --accent: #7ea2ff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+         gap: 8px; margin-bottom: 12px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 12px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .05em;
+     color: var(--muted); }
+.muted { color: var(--muted); }
+.banner { padding: 10px 14px; border-radius: 8px; font-weight: 600; margin-bottom: 12px;
+          border: 1px solid var(--line); background: var(--card); }
+.banner.ok { color: var(--ok); }
+.banner.warn { color: var(--warn); }
+.banner.bad { color: var(--bad); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+         gap: 10px; margin-bottom: 12px; }
+.card, .panel { background: var(--card); border: 1px solid var(--line);
+                border-radius: 10px; padding: 12px; }
+.card .label { color: var(--muted); font-size: 12px; }
+.card .value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.card.warn .value { color: var(--warn); }
+.card.bad .value { color: var(--bad); }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+          gap: 10px; margin-bottom: 12px; }
+svg.spark { width: 100%; height: 80px; display: block; color: var(--accent);
+            border-bottom: 1px solid var(--line); }
+.panel + .panel { margin-top: 12px; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+         font-variant-numeric: tabular-nums; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.expired { color: var(--bad); font-weight: 600; }
+td.err { max-width: 420px; overflow-wrap: anywhere; }
+.empty { color: var(--muted); padding: 4px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Job Queue Dashboard</h1>
+    <span id="updated" class="muted">Connecting...</span>
+  </header>
+
+  <div id="banner" class="banner">Connecting...</div>
+  <section id="cards" class="cards"></section>
+
+  <section class="charts">
+    <div class="panel">
+      <h2>Backlog: jobs ready now</h2>
+      <svg id="spark-backlog" class="spark" viewBox="0 0 300 80" preserveAspectRatio="none"></svg>
+      <div id="cap-backlog" class="muted"></div>
+    </div>
+    <div class="panel">
+      <h2>Latency: oldest ready job (seconds)</h2>
+      <svg id="spark-age" class="spark" viewBox="0 0 300 80" preserveAspectRatio="none"></svg>
+      <div id="cap-age" class="muted"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>In flight</h2>
+    <div id="inflight" class="scroll"></div>
+  </section>
+  <section class="panel">
+    <h2>Dead-letter queue (latest 20)</h2>
+    <div id="dead" class="scroll"></div>
+  </section>
+</main>
+
+<script nonce="__NONCE__">
+(function () {
+  "use strict";
+
+  const POLL_MS = 2000;      // how often we ask the API
+  const HISTORY = 60;        // samples kept for the charts (about 2 minutes)
+  const SLOW_SECONDS = 30;   // a ready job waiting longer than this is a warning
+  const history = { backlog: [], age: [] };
+
+  // SAFETY RULE: job types and error messages are untrusted text. We only ever set
+  // textContent (plain text) and never build markup from strings, so nothing
+  // a job contains can run as code in this page.
+  function el(tag, text, cls) {
+    const node = document.createElement(tag);
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    if (cls) node.className = cls;
+    return node;
+  }
+
+  async function getJson(path) {
+    const res = await fetch(path, { cache: "no-store" });
+    if (!res.ok) throw new Error(path + " returned " + res.status);
+    return res.json();
+  }
+
+  function fmtSeconds(value) {
+    return value === null || value === undefined ? "-" : value.toFixed(1) + "s";
+  }
+
+  function renderBanner(s) {
+    const problems = [];
+    const warnings = [];
+    if (s.dead > 0) problems.push(s.dead + " dead job(s)");
+    if (s.waiting_blocked > 0) problems.push(s.waiting_blocked + " job(s) blocked by a dead dependency");
+    if (s.in_flight_expired > 0) warnings.push(s.in_flight_expired + " expired lease(s): a worker may have died");
+    if ((s.oldest_ready_age_seconds || 0) > SLOW_SECONDS) {
+      warnings.push("jobs waiting over " + SLOW_SECONDS + "s: are workers running?");
+    }
+
+    let level = "ok";
+    let text = "Healthy: no dead jobs and no expired leases";
+    if (problems.length) {
+      level = "bad";
+      text = "Needs attention: " + problems.concat(warnings).join("; ");
+    } else if (warnings.length) {
+      level = "warn";
+      text = "Warning: " + warnings.join("; ");
+    }
+    const banner = document.getElementById("banner");
+    banner.className = "banner " + level;
+    banner.textContent = text;
+  }
+
+  function renderCards(s) {
+    const cards = [
+      ["Ready now", s.pending_ready, ""],
+      ["Scheduled", s.pending_scheduled, ""],
+      ["Waiting on deps", s.waiting, s.waiting_blocked > 0 ? "bad" : ""],
+      ["In flight", s.in_flight_active, ""],
+      ["Expired leases", s.in_flight_expired, s.in_flight_expired > 0 ? "warn" : ""],
+      ["Dead", s.dead, s.dead > 0 ? "bad" : ""],
+      ["Done", s.done, ""],
+      ["Oldest ready wait", fmtSeconds(s.oldest_ready_age_seconds),
+        (s.oldest_ready_age_seconds || 0) > SLOW_SECONDS ? "warn" : ""],
+    ];
+    const box = document.getElementById("cards");
+    box.replaceChildren();
+    cards.forEach(function (c) {
+      const card = el("div", null, "card " + c[2]);
+      card.appendChild(el("div", c[0], "label"));
+      card.appendChild(el("div", c[1], "value"));
+      box.appendChild(card);
+    });
+  }
+
+  function drawSpark(svgId, captionId, values, unit) {
+    const svg = document.getElementById(svgId);
+    svg.replaceChildren();
+    const caption = document.getElementById(captionId);
+    if (values.length < 2) { caption.textContent = "collecting data..."; return; }
+
+    const W = 300, H = 80, PAD = 4;
+    const peak = Math.max.apply(null, values);
+    const top = Math.max(1, peak);
+    const step = W / (HISTORY - 1);
+    const points = values.map(function (v, i) {
+      const x = (i + HISTORY - values.length) * step;     // newest sample at the right edge
+      const y = H - PAD - (v / top) * (H - 2 * PAD);
+      return x.toFixed(1) + "," + y.toFixed(1);
+    });
+
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    line.setAttribute("points", points.join(" "));
+    line.setAttribute("fill", "none");
+    line.setAttribute("stroke", "currentColor");
+    line.setAttribute("stroke-width", "2");
+    line.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(line);
+
+    caption.textContent = "now " + values[values.length - 1] + unit +
+      ", peak " + peak + unit + " (last " + values.length + " samples)";
+  }
+
+  function renderTable(box, columns, rows, emptyText) {
+    box.replaceChildren();
+    if (rows.length === 0) { box.appendChild(el("div", emptyText, "empty")); return; }
+    const table = el("table");
+    const headRow = el("tr");
+    columns.forEach(function (c) { headRow.appendChild(el("th", c.title)); });
+    const thead = el("thead");
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = el("tbody");
+    rows.forEach(function (row) {
+      const tr = el("tr");
+      columns.forEach(function (c) { tr.appendChild(c.cell(row)); });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    box.appendChild(table);
+  }
+
+  const inflightColumns = [
+    { title: "ID", cell: function (r) { return el("td", r.id); } },
+    { title: "Type", cell: function (r) { return el("td", r.job_type); } },
+    { title: "Worker", cell: function (r) { return el("td", r.locked_by || "-"); } },
+    { title: "Try", cell: function (r) { return el("td", r.attempts + "/" + r.max_attempts); } },
+    { title: "Lease", cell: function (r) {
+        const left = r.lease_remaining_seconds;
+        if (left === null || left === undefined) return el("td", "-");
+        if (left >= 0) return el("td", left.toFixed(1) + "s left");
+        return el("td", "EXPIRED " + (-left).toFixed(1) + "s ago", "expired");
+    } },
+  ];
+
+  const deadColumns = [
+    { title: "ID", cell: function (r) { return el("td", r.id); } },
+    { title: "Type", cell: function (r) { return el("td", r.job_type); } },
+    { title: "Tries", cell: function (r) { return el("td", r.attempts); } },
+    { title: "Died at", cell: function (r) { return el("td", String(r.updated_at).replace("T", " ")); } },
+    { title: "Error", cell: function (r) { return el("td", r.last_error || "", "err"); } },
+  ];
+
+  function remember(list, value) {
+    list.push(value);
+    if (list.length > HISTORY) list.shift();
+  }
+
+  async function refresh() {
+    if (!document.hidden) {                       // don't poll while the tab is hidden
+      try {
+        const results = await Promise.all([
+          getJson("/stats"),
+          getJson("/jobs/in-flight?limit=20"),
+          getJson("/jobs/dead?limit=20"),
+        ]);
+        const stats = results[0];
+        remember(history.backlog, stats.pending_ready);
+        remember(history.age, stats.oldest_ready_age_seconds || 0);
+
+        renderBanner(stats);
+        renderCards(stats);
+        drawSpark("spark-backlog", "cap-backlog", history.backlog, " jobs");
+        drawSpark("spark-age", "cap-age", history.age, "s");
+        renderTable(document.getElementById("inflight"), inflightColumns, results[1], "No jobs are in flight.");
+        renderTable(document.getElementById("dead"), deadColumns, results[2], "Dead-letter queue is empty.");
+        document.getElementById("updated").textContent = "Updated " + new Date().toLocaleTimeString();
+      } catch (err) {
+        const banner = document.getElementById("banner");
+        banner.className = "banner bad";
+        banner.textContent = "Cannot reach the API: " + err.message;
+      }
+    }
+    setTimeout(refresh, POLL_MS);                 // schedule the next poll AFTER this one ends
+  }
+
+  refresh();
+})();
+</script>
+</body>
+</html>

@@ -346,6 +346,26 @@ Failure handling:
 - A dead job that others depend on cannot be purged. Cancel the dependents first.
 - Integrity is kept in code, not with foreign keys, because tests use `TRUNCATE`.
 
+## Live dashboard
+
+```bash
+python -m jobqueue serve        # then open http://127.0.0.1:8000/
+```
+
+Shows queue health refreshed every 2 seconds: a health banner, stat cards (ready,
+scheduled, waiting, in flight, expired leases, dead, done, oldest wait), backlog and
+latency charts for the last ~2 minutes, in-flight jobs with lease countdowns, and the
+dead-letter list with error messages.
+
+Try it while the chaos test runs and watch the crash recovery happen:
+```bash
+python -m jobqueue chaos --jobs 300 --step-delay 0.3 --kills 10
+```
+
+Health rules: **red** = dead jobs or jobs blocked by a dead dependency; **amber** =
+expired leases or a ready job waiting more than 30 s; **green** otherwise.
+
+
 ## Design notes
 - **MySQL/InnoDB** gives transactions and row-level locks, which are required for safe multi-worker locking.
 - **Schema is designed up-front** (priority, run_at, lease columns) so later phases need no migrations.
@@ -357,6 +377,17 @@ Failure handling:
   Those stay in the CLI. It binds to `127.0.0.1` by default; don't expose it publicly.
 - **Limit:** `stats` scans the table. With millions of finished jobs you would add
   retention (delete old `done` jobs) or maintain counters.
+- **Polling, not SSE/WebSockets.** Open connections would each hold a thread (our
+  endpoints are blocking `def`s). Polling reuses the existing read-only endpoints and
+  pauses when the tab is hidden.
+- **One self-contained HTML file**: no libraries, no CDN, hand-drawn SVG charts.
+- **XSS-safe**: job types and errors are untrusted text, so the page only uses
+  `textContent` (a test fails if HTML-string APIs appear). A per-request
+  **Content-Security-Policy nonce** is a second layer: the browser runs only our own
+  script and may only call this server.
+- **Read-only** and bound to `127.0.0.1`, like the rest of the API (no authentication).
+- Chart history lives in the browser only; a real system would use a time-series
+  database (e.g. Prometheus + Grafana).
 
 ### Other design notes
 - Time comes from the database clock (`NOW(6)`), never from worker machines.
